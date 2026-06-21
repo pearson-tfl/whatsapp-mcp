@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -27,6 +28,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	waMmsRetry "go.mau.fi/whatsmeow/proto/waMmsRetry"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -1258,17 +1260,19 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message including timestamp
-	var mediaType, url string
+	var mediaType, url, sender string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
 	var fileLength uint64
 	var timestamp time.Time
+	var isFromMe bool
 	var err error
 
-	// Get media info AND timestamp from the database
+	// Get media info AND timestamp from the database. sender/is_from_me are also fetched
+	// so a CDN 403 can trigger a media-retry receipt (see requestMediaRetry).
 	err = messageStore.db.QueryRow(
-		"SELECT media_type, url, media_key, file_sha256, file_enc_sha256, file_length, timestamp FROM messages WHERE id = ? AND chat_jid = ?",
+		"SELECT media_type, url, media_key, file_sha256, file_enc_sha256, file_length, timestamp, sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
 		messageID, chatJID,
-	).Scan(&mediaType, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength, &timestamp)
+	).Scan(&mediaType, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength, &timestamp, &sender, &isFromMe)
 
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
@@ -1358,6 +1362,21 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// Download the media using whatsmeow client
 	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
+		// Since ~9 June 2026 WhatsApp's media CDN returns 403 for some accounts. The
+		// documented recovery is to ask the sender's device to re-upload the media via a
+		// media-retry receipt; the re-upload arrives asynchronously as an *events.MediaRetry,
+		// which handleMediaRetry fetches and caches. Re-running this download then serves the
+		// file from the local cache above.
+		if errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) ||
+			errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
+			errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) {
+			if rErr := requestMediaRetry(client, chatJID, messageID, sender, isFromMe, mediaKey); rErr != nil {
+				fmt.Printf("⚠️  Media %s rejected by CDN (%v); retry request failed: %v\n", messageID, err, rErr)
+			} else {
+				fmt.Printf("🔁 Media %s rejected by CDN (%v); requested re-upload from sender — retry download shortly\n", messageID, err)
+			}
+			return false, "", "", "", fmt.Errorf("media rejected by server, requested re-upload (retry shortly): %w", err)
+		}
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
 
@@ -1368,6 +1387,113 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
+}
+
+// requestMediaRetry asks the sender's device to re-upload the media for a message whose
+// download WhatsApp's CDN rejected (HTTP 403/404/410 — common for some accounts since
+// ~9 June 2026). The re-uploaded media arrives asynchronously as an *events.MediaRetry,
+// handled by handleMediaRetry.
+func requestMediaRetry(client *whatsmeow.Client, chatJID, messageID, sender string, isFromMe bool, mediaKey []byte) error {
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return fmt.Errorf("invalid chat JID %q: %w", chatJID, err)
+	}
+	info := &types.MessageInfo{
+		ID: types.MessageID(messageID),
+		MessageSource: types.MessageSource{
+			Chat:     chat,
+			IsFromMe: isFromMe,
+			IsGroup:  chat.Server == types.GroupServer,
+		},
+	}
+	if info.IsGroup && sender != "" {
+		if senderJID, perr := types.ParseJID(sender); perr == nil {
+			info.Sender = senderJID
+		}
+	}
+	return client.SendMediaRetryReceipt(context.Background(), info, mediaKey)
+}
+
+// handleMediaRetry processes a media re-upload notification triggered by requestMediaRetry.
+// It decrypts the notification to obtain a fresh directPath, downloads the media, and caches
+// it to disk using the same naming scheme as downloadMedia, so a subsequent download_media
+// call is served from the local cache.
+func handleMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, evt *events.MediaRetry, logger waLog.Logger) {
+	messageID := string(evt.MessageID)
+
+	// The notification's ChatID can come back in @lid form, whereas the bridge stores
+	// messages under the phone (@s.whatsapp.net) chat JID (see the LID migrations). Look
+	// the message up by its globally-unique ID and use the chat_jid recorded in the DB,
+	// so the cached file lands where download_media will look for it.
+	var mediaType, chatJID string
+	var mediaKey, fileSHA256, fileEncSHA256 []byte
+	var timestamp time.Time
+	err := messageStore.db.QueryRow(
+		"SELECT media_type, media_key, file_sha256, file_enc_sha256, timestamp, chat_jid FROM messages WHERE id = ? LIMIT 1",
+		messageID,
+	).Scan(&mediaType, &mediaKey, &fileSHA256, &fileEncSHA256, &timestamp, &chatJID)
+	if err != nil {
+		logger.Warnf("Media retry for unknown message %s (chat %s): %v", messageID, evt.ChatID.String(), err)
+		return
+	}
+	if mediaType == "" || len(mediaKey) == 0 {
+		logger.Warnf("Media retry for %s: missing media info in DB", messageID)
+		return
+	}
+
+	notif, err := whatsmeow.DecryptMediaRetryNotification(evt, mediaKey)
+	if err != nil {
+		logger.Warnf("Failed to decrypt media retry notification for %s: %v", messageID, err)
+		return
+	}
+	if notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS {
+		logger.Warnf("Media retry for %s unsuccessful (result=%s)", messageID, notif.GetResult())
+		return
+	}
+	directPath := notif.GetDirectPath()
+	if directPath == "" {
+		logger.Warnf("Media retry for %s succeeded but returned no direct path", messageID)
+		return
+	}
+
+	var waMediaType whatsmeow.MediaType
+	var ext string
+	switch mediaType {
+	case "image":
+		waMediaType, ext = whatsmeow.MediaImage, ".jpg"
+	case "video":
+		waMediaType, ext = whatsmeow.MediaVideo, ".mp4"
+	case "audio":
+		waMediaType, ext = whatsmeow.MediaAudio, ".ogg"
+	case "document":
+		waMediaType, ext = whatsmeow.MediaDocument, ""
+	default:
+		logger.Warnf("Media retry for %s: unsupported media type %q", messageID, mediaType)
+		return
+	}
+
+	mediaData, err := client.DownloadMediaWithPath(
+		context.Background(), directPath, fileEncSHA256, fileSHA256, mediaKey,
+		waMediaType, "", false,
+	)
+	if err != nil {
+		logger.Warnf("Failed to download media after retry for %s: %v", messageID, err)
+		return
+	}
+
+	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	if err := os.MkdirAll(chatDir, 0755); err != nil {
+		logger.Warnf("Failed to create chat dir for retried media %s: %v", messageID, err)
+		return
+	}
+	filename := fmt.Sprintf("%s_%s_%s%s", mediaType, timestamp.Format("20060102_150405"), messageID, ext)
+	localPath := fmt.Sprintf("%s/%s", chatDir, filename)
+	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+		logger.Warnf("Failed to save retried media %s: %v", messageID, err)
+		return
+	}
+	absPath, _ := filepath.Abs(localPath)
+	logger.Infof("✅ Media retry succeeded: cached %s (%d bytes) → %s", messageID, len(mediaData), absPath)
 }
 
 // Extract direct path from a WhatsApp media URL
@@ -1714,6 +1840,11 @@ func main() {
 		case *events.Message:
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
+
+		case *events.MediaRetry:
+			// Re-upload notification from the sender's device, triggered by requestMediaRetry
+			// when a media download was rejected (403/404/410). Fetch + cache the media now.
+			handleMediaRetry(client, messageStore, v, logger)
 
 		case *events.HistorySync:
 			// Process history sync events
