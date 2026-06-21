@@ -17,6 +17,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -1370,12 +1371,26 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		if errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) ||
 			errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
 			errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) {
+			// Register a waiter, ask the sender's device to re-upload, then block until
+			// handleMediaRetry fetches the fresh copy (or time out). This keeps CDN-403
+			// recovery transparent: a single download_media call still returns the media.
+			waiter := registerRetryWaiter(messageID)
+			defer unregisterRetryWaiter(messageID)
+
 			if rErr := requestMediaRetry(client, chatJID, messageID, sender, isFromMe, mediaKey); rErr != nil {
-				fmt.Printf("⚠️  Media %s rejected by CDN (%v); retry request failed: %v\n", messageID, err, rErr)
-			} else {
-				fmt.Printf("🔁 Media %s rejected by CDN (%v); requested re-upload from sender — retry download shortly\n", messageID, err)
+				return false, "", "", "", fmt.Errorf("media rejected by CDN and retry request failed: %w", rErr)
 			}
-			return false, "", "", "", fmt.Errorf("media rejected by server, requested re-upload (retry shortly): %w", err)
+			fmt.Printf("🔁 Media %s rejected by CDN (%v); requested re-upload, waiting for sender…\n", messageID, err)
+
+			select {
+			case res := <-waiter:
+				if res.err != nil {
+					return false, "", "", "", fmt.Errorf("media re-upload failed: %w", res.err)
+				}
+				return true, res.mediaType, res.filename, res.path, nil
+			case <-time.After(mediaRetryWaitTimeout):
+				return false, "", "", "", fmt.Errorf("timed out after %s waiting for media re-upload (sender may be offline): %w", mediaRetryWaitTimeout, err)
+			}
 		}
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -1387,6 +1402,54 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
+}
+
+// mediaRetryWaitTimeout bounds how long downloadMedia blocks waiting for a media re-upload
+// after a CDN 403. Kept under the HTTP server's 60s WriteTimeout.
+const mediaRetryWaitTimeout = 25 * time.Second
+
+// retryResult carries the outcome of a media re-upload back to a download_media caller
+// that is blocking in downloadMedia waiting for it.
+type retryResult struct {
+	mediaType string
+	filename  string
+	path      string
+	err       error
+}
+
+// pendingRetries lets downloadMedia (HTTP handler goroutine) block until handleMediaRetry
+// (event goroutine) has fetched the re-uploaded media for the same message ID.
+var (
+	pendingRetriesMu sync.Mutex
+	pendingRetries   = make(map[string]chan retryResult)
+)
+
+func registerRetryWaiter(messageID string) chan retryResult {
+	ch := make(chan retryResult, 1)
+	pendingRetriesMu.Lock()
+	pendingRetries[messageID] = ch
+	pendingRetriesMu.Unlock()
+	return ch
+}
+
+func unregisterRetryWaiter(messageID string) {
+	pendingRetriesMu.Lock()
+	delete(pendingRetries, messageID)
+	pendingRetriesMu.Unlock()
+}
+
+// signalRetryWaiter delivers a retry outcome to a blocked downloadMedia caller, if any.
+// No-op when there is no waiter (spontaneous re-upload, or the caller already timed out).
+func signalRetryWaiter(messageID string, res retryResult) {
+	pendingRetriesMu.Lock()
+	ch, ok := pendingRetries[messageID]
+	pendingRetriesMu.Unlock()
+	if ok {
+		select {
+		case ch <- res:
+		default:
+		}
+	}
 }
 
 // requestMediaRetry asks the sender's device to re-upload the media for a message whose
@@ -1420,6 +1483,10 @@ func requestMediaRetry(client *whatsmeow.Client, chatJID, messageID, sender stri
 // call is served from the local cache.
 func handleMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, evt *events.MediaRetry, logger waLog.Logger) {
 	messageID := string(evt.MessageID)
+
+	// Deliver the outcome to a download_media caller blocking in downloadMedia, if any.
+	result := retryResult{err: fmt.Errorf("re-upload did not complete (sender may no longer have the media)")}
+	defer func() { signalRetryWaiter(messageID, result) }()
 
 	// The notification's ChatID can come back in @lid form, whereas the bridge stores
 	// messages under the phone (@s.whatsapp.net) chat JID (see the LID migrations). Look
@@ -1493,6 +1560,7 @@ func handleMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, evt 
 		return
 	}
 	absPath, _ := filepath.Abs(localPath)
+	result = retryResult{mediaType: mediaType, filename: filename, path: absPath, err: nil}
 	logger.Infof("✅ Media retry succeeded: cached %s (%d bytes) → %s", messageID, len(mediaData), absPath)
 }
 
