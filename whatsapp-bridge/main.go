@@ -671,8 +671,7 @@ type SendMessageRequest struct {
 
 // Function to send a WhatsApp message.
 // messageStore and logger are used to write the sent message into the store,
-// so the estate's own outbound traffic is on the record; see
-// storeOutgoingMessage.
+// so the bridge's own sends are on the record; see storeOutgoingMessage.
 func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string,
 	mediaPath string, logger waLog.Logger) (bool, string) {
 	if !client.IsConnected() {
@@ -873,7 +872,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	// the log stays the fallback record it is today.
 	if storeErr := storeOutgoingMessage(client, messageStore, recipientJID, recipientHint,
 		resp.ID, msg, resp.Timestamp, logger); storeErr != nil {
-		fmt.Printf("Warning: message sent to %s but not stored: %v\n", recipient, storeErr)
+		logger.Warnf("Message sent to %s but not stored: %v", recipient, storeErr)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -1197,8 +1196,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 // WhatsApp echoes the user's sends from other devices back to this one as an
 // events.Message, which handleMessage stores. It does not echo a send back to
 // the device that made it, so messages posted through /api/send were delivered
-// but never written to messages.db — the store could not see the estate's own
-// outbound traffic.
+// but never written to messages.db — the store could not see what this bridge
+// had sent.
 //
 // This is the outbound twin of handleMessage and deliberately reuses the same
 // helpers, so a sent message lands in the store with the same chat JID, sender
@@ -1223,13 +1222,14 @@ func storeOutgoingMessage(client *whatsmeow.Client, messageStore *MessageStore, 
 	resolvedChat := resolveLIDChat(client, chat, types.EmptyJID, recipientHint, true)
 	chatJID := resolvedChat.String()
 
-	// The sender is us. Use our own phone JID as its own alt hint, so an
-	// account whose Store.ID is a LID still resolves through the LID store.
+	// The sender is us. There is no separate phone-JID hint to give: our own
+	// JID is the hint. An account whose Store.ID is itself a LID resolves
+	// through the LID store, which is resolveUserJID's remaining fallback.
 	var own types.JID
 	if client != nil && client.Store != nil && client.Store.ID != nil {
 		own = client.Store.ID.ToNonAD()
 	}
-	sender := resolveUserJID(client, own, own).User
+	sender := resolveUserJID(client, own, types.EmptyJID).User
 
 	content := extractTextContent(msg)
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg, timestamp, msgID)
@@ -1238,9 +1238,13 @@ func storeOutgoingMessage(client *whatsmeow.Client, messageStore *MessageStore, 
 		return nil
 	}
 
-	name := GetChatName(client, messageStore, resolvedChat, chatJID, nil, sender, logger)
+	// GetChatName's last-resort name for a 1:1 chat is the user-part it is
+	// handed. handleMessage hands it the message sender, which inbound is the
+	// peer. Here the sender is us, so hand it the chat's own user-part, or a
+	// brand-new chat would be named after our number instead of theirs.
+	name := GetChatName(client, messageStore, resolvedChat, chatJID, nil, resolvedChat.User, logger)
 	if err := messageStore.StoreChat(chatJID, name, timestamp); err != nil {
-		return fmt.Errorf("failed to store chat: %v", err)
+		return fmt.Errorf("failed to store chat: %w", err)
 	}
 
 	if err := messageStore.StoreMessage(
@@ -1258,7 +1262,7 @@ func storeOutgoingMessage(client *whatsmeow.Client, messageStore *MessageStore, 
 		fileEncSHA256,
 		fileLength,
 	); err != nil {
-		return fmt.Errorf("failed to store message: %v", err)
+		return fmt.Errorf("failed to store message: %w", err)
 	}
 
 	return nil

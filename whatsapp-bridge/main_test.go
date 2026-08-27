@@ -1416,3 +1416,104 @@ func TestStoreOutgoingMessage_WritesToRealMessagesDB(t *testing.T) {
 		t.Error("expected is_from_me to be true")
 	}
 }
+
+// A first send to a contact the store has never seen must name the chat after
+// the recipient. GetChatName's last-resort name is the user-part it is handed,
+// and for an outbound message the sender is us, so handing it the sender would
+// name the chat after our own number.
+func TestStoreOutgoingMessage_NewChatNamedAfterRecipient(t *testing.T) {
+	self := types.JID{User: "447854069173", Server: types.DefaultUserServer}
+	client := newTestClientWithSelf(&mockLIDStore{}, self)
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(client, ms, phoneLID, phonePN, "out-008",
+		textToSend("first contact"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	name, found := queryChat(ms, phonePN.String())
+	if !found {
+		t.Fatal("expected a chat row for the recipient")
+	}
+	if name == self.User {
+		t.Errorf("chat named after our own number %s, expected the recipient", self.User)
+	}
+	if name != phonePN.User {
+		t.Errorf("expected chat name %s (the recipient), got %q", phonePN.User, name)
+	}
+}
+
+// An account whose own Store.ID is a LID must still store the phone user-part
+// as the sender, resolved through the LID store.
+func TestStoreOutgoingMessage_OwnLIDSenderResolvedViaStore(t *testing.T) {
+	ownLID := types.JID{User: "999888777666555", Server: types.HiddenUserServer}
+	ownPN := types.JID{User: "447854069173", Server: types.DefaultUserServer}
+	lidStore := &mockLIDStore{pnByLID: map[types.JID]types.JID{ownLID: ownPN}}
+
+	client := newTestClient(lidStore)
+	id := ownLID.ToNonAD()
+	client.Store.ID = &id
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(client, ms, phonePN, phonePN, "out-009",
+		textToSend("from a LID account"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	row, _ := queryOutgoingRow(t, ms, "out-009")
+	if row.sender != ownPN.User {
+		t.Errorf("expected sender %s resolved from the LID store, got %s", ownPN.User, row.sender)
+	}
+}
+
+// An account whose own Store.ID is a LID the store cannot map keeps the LID
+// user-part rather than storing an empty sender.
+func TestStoreOutgoingMessage_OwnLIDWithoutMappingKeepsLID(t *testing.T) {
+	ownLID := types.JID{User: "999888777666555", Server: types.HiddenUserServer}
+	client := newTestClient(&mockLIDStore{})
+	id := ownLID.ToNonAD()
+	client.Store.ID = &id
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(client, ms, phonePN, phonePN, "out-010",
+		textToSend("unmapped LID account"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	row, _ := queryOutgoingRow(t, ms, "out-010")
+	if row.sender != ownLID.User {
+		t.Errorf("expected sender to fall back to the LID user-part %s, got %s", ownLID.User, row.sender)
+	}
+}
+
+// A group send stores under the group JID untouched — the LID rewrite that
+// applies to 1:1 recipients must not touch a group. The chat is seeded with a
+// name so GetChatName short-circuits and the test needs no connection.
+func TestStoreOutgoingMessage_GroupSendStoredUnderGroupJID(t *testing.T) {
+	group := types.JID{User: "120363151143532472", Server: types.GroupServer}
+	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
+	ms := newTestMessageStore(t)
+
+	if err := ms.StoreChat(group.String(), "Family", time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("failed to seed group chat: %v", err)
+	}
+
+	if err := storeOutgoingMessage(client, ms, group, group, "out-011",
+		textToSend("group digest"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	row, chatJID := queryOutgoingRow(t, ms, "out-011")
+	if chatJID != group.String() {
+		t.Errorf("expected chat_jid %s, got %s", group, chatJID)
+	}
+	if !row.isFromMe {
+		t.Error("expected is_from_me to be true for a group send")
+	}
+	if row.sender != phonePN.User {
+		t.Errorf("expected sender %s, got %s", phonePN.User, row.sender)
+	}
+	if name, _ := queryChat(ms, group.String()); name != "Family" {
+		t.Errorf("expected the group name Family to be preserved, got %q", name)
+	}
+}
