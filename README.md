@@ -412,6 +412,7 @@ sequenceDiagram
     participant Claude as Claude Desktop
     participant MCP as Python MCP Server
     participant Bridge as Go Bridge
+    participant DB as SQLite messages.db
     participant WA as WhatsApp
 
     User->>Claude: "Send 'Hello' to Mom"
@@ -419,6 +420,7 @@ sequenceDiagram
     MCP->>Bridge: POST /api/send
     Bridge->>WA: Send via WebSocket
     WA-->>Bridge: Delivery confirmation
+    Bridge->>DB: Store sent message (is_from_me)
     Bridge-->>MCP: Success response
     MCP-->>Claude: Message sent
     Claude-->>User: "Message sent to Mom"

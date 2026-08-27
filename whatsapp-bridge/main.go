@@ -669,8 +669,12 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
-// Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+// Function to send a WhatsApp message.
+// messageStore and logger are used to write the sent message into the store,
+// so the estate's own outbound traffic is on the record; see
+// storeOutgoingMessage.
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string,
+	mediaPath string, logger waLog.Logger) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -695,6 +699,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			Server: "s.whatsapp.net", // For personal chats
 		}
 	}
+
+	// Keep the recipient JID as supplied, before the LID rewrite below. The
+	// store keys chats by phone JID, so this is the hint storeOutgoingMessage
+	// needs to file the sent message alongside received ones.
+	recipientHint := recipientJID.ToNonAD()
 
 	// For personal chats, resolve phone number JID to LID (Linked Identity).
 	// WhatsApp is migrating to LID-based addressing; messages sent to the
@@ -853,10 +862,18 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// Record our own send. A store failure does not make a delivered message
+	// undelivered, so it is logged rather than reported as a send failure —
+	// the log stays the fallback record it is today.
+	if storeErr := storeOutgoingMessage(client, messageStore, recipientJID, recipientHint,
+		resp.ID, msg, resp.Timestamp, logger); storeErr != nil {
+		fmt.Printf("Warning: message sent to %s but not stored: %v\n", recipient, storeErr)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -1173,6 +1190,78 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
+}
+
+// storeOutgoingMessage persists a message this bridge sent itself.
+//
+// WhatsApp echoes the user's sends from other devices back to this one as an
+// events.Message, which handleMessage stores. It does not echo a send back to
+// the device that made it, so messages posted through /api/send were delivered
+// but never written to messages.db — the store could not see the estate's own
+// outbound traffic.
+//
+// This is the outbound twin of handleMessage and deliberately reuses the same
+// helpers, so a sent message lands in the store with the same chat JID, sender
+// and media columns a received one would.
+//
+// recipientHint is the recipient JID as the caller supplied it, before the
+// send path rewrote it to a LID. It plays the part RecipientAlt plays for an
+// echoed outgoing message: the phone JID that lets resolveLIDChat put sent and
+// received messages in one chat.
+func storeOutgoingMessage(client *whatsmeow.Client, messageStore *MessageStore, chat, recipientHint types.JID,
+	msgID string, msg *waProto.Message, timestamp time.Time, logger waLog.Logger) error {
+	if messageStore == nil {
+		return fmt.Errorf("no message store")
+	}
+	if msgID == "" {
+		return fmt.Errorf("no message ID")
+	}
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+
+	resolvedChat := resolveLIDChat(client, chat, types.EmptyJID, recipientHint, true)
+	chatJID := resolvedChat.String()
+
+	// The sender is us. Use our own phone JID as its own alt hint, so an
+	// account whose Store.ID is a LID still resolves through the LID store.
+	var own types.JID
+	if client != nil && client.Store != nil && client.Store.ID != nil {
+		own = client.Store.ID.ToNonAD()
+	}
+	sender := resolveUserJID(client, own, own).User
+
+	content := extractTextContent(msg)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg, timestamp, msgID)
+
+	if content == "" && mediaType == "" {
+		return nil
+	}
+
+	name := GetChatName(client, messageStore, resolvedChat, chatJID, nil, sender, logger)
+	if err := messageStore.StoreChat(chatJID, name, timestamp); err != nil {
+		return fmt.Errorf("failed to store chat: %v", err)
+	}
+
+	if err := messageStore.StoreMessage(
+		msgID,
+		chatJID,
+		sender,
+		content,
+		timestamp,
+		true, // is_from_me: the bridge sent it
+		mediaType,
+		filename,
+		url,
+		mediaKey,
+		fileSHA256,
+		fileEncSHA256,
+		fileLength,
+	); err != nil {
+		return fmt.Errorf("failed to store message: %v", err)
+	}
+
+	return nil
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -1585,7 +1674,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, logger waLog.Logger) {
 	// Health check endpoint
 	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1630,7 +1719,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, logger)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -2113,7 +2202,7 @@ connectionSuccess:
 		}
 		port = v
 	}
-	startRESTServer(client, messageStore, port)
+	startRESTServer(client, messageStore, port, logger)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
