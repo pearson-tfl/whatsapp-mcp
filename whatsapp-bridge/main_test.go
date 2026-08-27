@@ -1517,3 +1517,155 @@ func TestStoreOutgoingMessage_GroupSendStoredUnderGroupJID(t *testing.T) {
 		t.Errorf("expected the group name Family to be preserved, got %q", name)
 	}
 }
+
+// A send to a group the store has never seen must not make a network request.
+// GetGroupInfo carries whatsmeow's 75-second request timeout, which outlives
+// the 60-second HTTP write timeout on /api/send, so a delivered group message
+// could return a failure to the caller and invite a duplicate send.
+//
+// The client is nil on purpose. It is the structural proof: any group-info
+// lookup on this path would dereference it and panic. A name assertion alone
+// could not tell the two apart, because GetChatName on a disconnected client
+// falls back to a generated name too.
+func TestStoreOutgoingMessage_UnseededGroup_MakesNoNetworkLookup(t *testing.T) {
+	group := types.JID{User: "120363151143532472", Server: types.GroupServer}
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(nil, ms, group, group, "out-012",
+		textToSend("first group send"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	row, chatJID := queryOutgoingRow(t, ms, "out-012")
+	if chatJID != group.String() {
+		t.Errorf("expected chat_jid %s, got %s", group, chatJID)
+	}
+	if !row.isFromMe {
+		t.Error("expected is_from_me to be true for a group send")
+	}
+
+	// The name is left empty so a later inbound message can fill it in.
+	name, found := queryChat(ms, group.String())
+	if !found {
+		t.Fatal("expected a chat row for the group")
+	}
+	if name != "" {
+		t.Errorf("expected an empty group name pending an inbound message, got %q", name)
+	}
+}
+
+// The empty name a first group send leaves behind must not be permanent: the
+// next inbound message from that group fills the real name in. This is why the
+// send stores an empty name rather than a generated one — GetChatName keeps an
+// existing name only when it is non-empty.
+func TestStoreOutgoingMessage_EmptyGroupNameFilledByInboundMessage(t *testing.T) {
+	group := types.JID{User: "120363151143532472", Server: types.GroupServer}
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(nil, ms, group, group, "out-013",
+		textToSend("first group send"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+	if name, _ := queryChat(ms, group.String()); name != "" {
+		t.Fatalf("expected an empty group name after the send, got %q", name)
+	}
+
+	// An inbound message from the same group, with a name already resolved
+	// into the chats row the way history sync or group info would supply it.
+	if err := ms.StoreChat(group.String(), "Family", time.Now()); err != nil {
+		t.Fatalf("failed to store the resolved chat name: %v", err)
+	}
+
+	client := newTestClient(&mockLIDStore{})
+	if name := outgoingChatName(client, ms, group, group.String(), testLogger()); name != "Family" {
+		t.Errorf("expected the filled-in name Family to be kept, got %q", name)
+	}
+}
+
+// --- Wiring: sendWhatsAppMessage must call the store (#674) ---
+
+// stubWhatsAppSend replaces the two points at which sendWhatsAppMessage
+// reaches WhatsApp, so the rest of the function — including the store write —
+// runs without a connection. The stub reports the given message ID and time.
+func stubWhatsAppSend(t *testing.T, msgID string, sentAt time.Time) {
+	t.Helper()
+	realConnected, realSend := clientIsConnected, clientSendMessage
+	t.Cleanup(func() { clientIsConnected, clientSendMessage = realConnected, realSend })
+
+	clientIsConnected = func(*whatsmeow.Client) bool { return true }
+	clientSendMessage = func(*whatsmeow.Client, types.JID,
+		*waProto.Message) (whatsmeow.SendResponse, error) {
+		return whatsmeow.SendResponse{ID: msgID, Timestamp: sentAt}, nil
+	}
+}
+
+// This is the regression guard for #674 itself: it fails if sendWhatsAppMessage
+// ever stops writing what it sent into the store. Every other test in this
+// group calls storeOutgoingMessage directly and would stay green if the two
+// were disconnected.
+func TestSendWhatsAppMessage_StoresTheSentMessage(t *testing.T) {
+	sentAt := time.Now().Truncate(time.Second)
+	stubWhatsAppSend(t, "wired-001", sentAt)
+
+	lidStore := &mockLIDStore{pnByLID: map[types.JID]types.JID{phoneLID: phonePN}}
+	client := newTestClientWithSelf(lidStore, phonePN)
+	ms := newTestMessageStore(t)
+
+	// Address the LID directly, so the send path's own phone-to-LID lookup —
+	// which would reach the network — is skipped.
+	ok, msg := sendWhatsAppMessage(client, ms, phoneLID.String(), "wired through to the store", "", testLogger())
+	if !ok {
+		t.Fatalf("expected the send to succeed, got %q", msg)
+	}
+
+	row, chatJID := queryOutgoingRow(t, ms, "wired-001")
+	if chatJID != phonePN.String() {
+		t.Errorf("expected chat_jid %s, got %s", phonePN, chatJID)
+	}
+	if row.content != "wired through to the store" {
+		t.Errorf("expected the sent text as content, got %q", row.content)
+	}
+	if !row.isFromMe {
+		t.Error("expected is_from_me to be true")
+	}
+	if row.sender != phonePN.User {
+		t.Errorf("expected sender %s, got %s", phonePN.User, row.sender)
+	}
+}
+
+// A send that fails must not leave a row behind.
+func TestSendWhatsAppMessage_FailedSendStoresNothing(t *testing.T) {
+	realConnected, realSend := clientIsConnected, clientSendMessage
+	t.Cleanup(func() { clientIsConnected, clientSendMessage = realConnected, realSend })
+	clientIsConnected = func(*whatsmeow.Client) bool { return true }
+	clientSendMessage = func(*whatsmeow.Client, types.JID, *waProto.Message) (whatsmeow.SendResponse, error) {
+		return whatsmeow.SendResponse{}, io.ErrUnexpectedEOF
+	}
+
+	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
+	ms := newTestMessageStore(t)
+
+	if ok, _ := sendWhatsAppMessage(client, ms, phoneLID.String(), "never delivered", "", testLogger()); ok {
+		t.Fatal("expected the send to report failure")
+	}
+	if count := queryMessageCount(ms, phonePN.String()); count != 0 {
+		t.Errorf("expected nothing stored for a failed send, got %d rows", count)
+	}
+}
+
+// A store failure must not turn a delivered message into a failed send.
+func TestSendWhatsAppMessage_StoreFailureStillReportsSuccess(t *testing.T) {
+	stubWhatsAppSend(t, "wired-002", time.Now())
+
+	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
+	ms := newTestMessageStore(t)
+	// Close the database so every write fails.
+	if err := ms.db.Close(); err != nil {
+		t.Fatalf("failed to close the test database: %v", err)
+	}
+
+	ok, msg := sendWhatsAppMessage(client, ms, phoneLID.String(), "delivered but unstorable", "", testLogger())
+	if !ok {
+		t.Errorf("expected a delivered message to report success despite the store failure, got %q", msg)
+	}
+}

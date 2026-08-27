@@ -669,12 +669,29 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// clientIsConnected and clientSendMessage are the two points at which
+// sendWhatsAppMessage reaches WhatsApp. They are package-level variables so a
+// test can drive the rest of that function — including the store write this
+// ticket adds — without a WhatsApp connection, and so a test can fail if that
+// store write is ever disconnected from the send. Production never reassigns
+// them.
+var (
+	clientIsConnected = func(client *whatsmeow.Client) bool {
+		return client.IsConnected()
+	}
+
+	clientSendMessage = func(client *whatsmeow.Client, to types.JID,
+		msg *waProto.Message) (whatsmeow.SendResponse, error) {
+		return client.SendMessage(context.Background(), to, msg)
+	}
+)
+
 // Function to send a WhatsApp message.
 // messageStore and logger are used to write the sent message into the store,
 // so the bridge's own sends are on the record; see storeOutgoingMessage.
 func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string,
 	mediaPath string, logger waLog.Logger) (bool, string) {
-	if !client.IsConnected() {
+	if !clientIsConnected(client) {
 		return false, "Not connected to WhatsApp"
 	}
 
@@ -861,7 +878,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	}
 
 	// Send message
-	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := clientSendMessage(client, recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
@@ -1191,6 +1208,39 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 }
 
+// outgoingChatName returns the name to file a sent chat under, and makes no
+// network request in doing so.
+//
+// GetChatName asks the WhatsApp server for a group's name when that group is
+// not already in the store. whatsmeow gives that request a 75-second timeout,
+// which outlives the 60-second write timeout on this bridge's HTTP server. On
+// the post-send path that would let an already-delivered group message return
+// a failed response to the caller, inviting it to send a duplicate. So a group
+// we have never stored is filed with an empty name, and the first inbound
+// message from it fills the real name in — GetChatName only keeps an existing
+// name when that name is non-empty.
+//
+// The 1:1 branch stays on GetChatName: its contact lookup reads the local
+// whatsmeow store, not the network.
+func outgoingChatName(client *whatsmeow.Client, messageStore *MessageStore, chat types.JID,
+	chatJID string, logger waLog.Logger) string {
+	var existing string
+	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existing)
+	if err == nil && existing != "" {
+		return existing
+	}
+
+	if chat.Server == types.GroupServer {
+		return ""
+	}
+
+	// GetChatName's last-resort name for a 1:1 chat is the user-part it is
+	// handed. handleMessage hands it the message sender, which inbound is the
+	// peer. Here the sender is us, so hand it the chat's own user-part, or a
+	// brand-new chat would be named after our number instead of theirs.
+	return GetChatName(client, messageStore, chat, chatJID, nil, chat.User, logger)
+}
+
 // storeOutgoingMessage persists a message this bridge sent itself.
 //
 // WhatsApp echoes the user's sends from other devices back to this one as an
@@ -1238,11 +1288,7 @@ func storeOutgoingMessage(client *whatsmeow.Client, messageStore *MessageStore, 
 		return nil
 	}
 
-	// GetChatName's last-resort name for a 1:1 chat is the user-part it is
-	// handed. handleMessage hands it the message sender, which inbound is the
-	// peer. Here the sender is us, so hand it the chat's own user-part, or a
-	// brand-new chat would be named after our number instead of theirs.
-	name := GetChatName(client, messageStore, resolvedChat, chatJID, nil, resolvedChat.User, logger)
+	name := outgoingChatName(client, messageStore, resolvedChat, chatJID, logger)
 	if err := messageStore.StoreChat(chatJID, name, timestamp); err != nil {
 		return fmt.Errorf("failed to store chat: %w", err)
 	}
