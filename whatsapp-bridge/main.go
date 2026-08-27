@@ -669,29 +669,31 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
-// clientIsConnected and clientSendMessage are the two points at which
-// sendWhatsAppMessage reaches WhatsApp. They are package-level variables so a
-// test can drive the rest of that function — including the store write this
-// ticket adds — without a WhatsApp connection, and so a test can fail if that
-// store write is ever disconnected from the send. Production never reassigns
-// them.
-var (
-	clientIsConnected = func(client *whatsmeow.Client) bool {
-		return client.IsConnected()
-	}
-
-	clientSendMessage = func(client *whatsmeow.Client, to types.JID,
-		msg *waProto.Message) (whatsmeow.SendResponse, error) {
-		return client.SendMessage(context.Background(), to, msg)
-	}
-)
+// whatsAppDelivery is the part of *whatsmeow.Client that sendWhatsAppMessage
+// uses to deliver a message. It is a seam: a test supplies its own
+// implementation and drives the rest of that function — including the store
+// write this ticket adds — with no WhatsApp connection, so a test fails if
+// that store write is ever disconnected from the send.
+//
+// It is a parameter rather than package state on purpose. A package-level
+// variable would work today, because no test in this package calls
+// t.Parallel(), but the first one that did would race silently. This is safe
+// whatever the tests do later. *whatsmeow.Client implements it as it stands.
+type whatsAppDelivery interface {
+	IsConnected() bool
+	SendMessage(ctx context.Context, to types.JID, message *waProto.Message,
+		extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
+}
 
 // Function to send a WhatsApp message.
 // messageStore and logger are used to write the sent message into the store,
 // so the bridge's own sends are on the record; see storeOutgoingMessage.
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string,
-	mediaPath string, logger waLog.Logger) (bool, string) {
-	if !clientIsConnected(client) {
+// wa delivers the message; client is used for everything else — the LID
+// stores, contact lookups and media upload. In production both are the same
+// whatsmeow client.
+func sendWhatsAppMessage(client *whatsmeow.Client, wa whatsAppDelivery, messageStore *MessageStore,
+	recipient string, message string, mediaPath string, logger waLog.Logger) (bool, string) {
+	if !wa.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
 
@@ -878,7 +880,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	}
 
 	// Send message
-	resp, err := clientSendMessage(client, recipientJID, msg)
+	resp, err := wa.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
@@ -1224,13 +1226,15 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 // whatsmeow store, not the network.
 func outgoingChatName(client *whatsmeow.Client, messageStore *MessageStore, chat types.JID,
 	chatJID string, logger waLog.Logger) string {
-	var existing string
-	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existing)
-	if err == nil && existing != "" {
-		return existing
-	}
-
 	if chat.Server == types.GroupServer {
+		// Keep a name we already have; otherwise leave it for an inbound
+		// message to fill in. GetChatName makes this same check, but reaching
+		// it would risk the group-info request described above.
+		var existing string
+		err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existing)
+		if err == nil {
+			return existing
+		}
 		return ""
 	}
 
@@ -1769,7 +1773,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath, logger)
+		// The client both delivers the message and backs the lookups.
+		success, message := sendWhatsAppMessage(client, client, messageStore,
+			req.Recipient, req.Message, req.MediaPath, logger)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")

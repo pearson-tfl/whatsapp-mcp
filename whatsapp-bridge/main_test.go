@@ -1523,10 +1523,13 @@ func TestStoreOutgoingMessage_GroupSendStoredUnderGroupJID(t *testing.T) {
 // the 60-second HTTP write timeout on /api/send, so a delivered group message
 // could return a failure to the caller and invite a duplicate send.
 //
-// The client is nil on purpose. It is the structural proof: any group-info
-// lookup on this path would dereference it and panic. A name assertion alone
-// could not tell the two apart, because GetChatName on a disconnected client
-// falls back to a generated name too.
+// The client is nil on purpose, as a tripwire: if this path ever regains a
+// client call, it will panic here rather than pass quietly. That is less than
+// proof of absence — the group branch returns before touching the client at
+// all, so the nil is never dereferenced either way, and it relies on whatsmeow
+// methods panicking on a nil receiver. A name assertion alone would prove even
+// less, because GetChatName on a disconnected client also falls back to a
+// generated name.
 func TestStoreOutgoingMessage_UnseededGroup_MakesNoNetworkLookup(t *testing.T) {
 	group := types.JID{User: "120363151143532472", Server: types.GroupServer}
 	ms := newTestMessageStore(t)
@@ -1584,19 +1587,37 @@ func TestStoreOutgoingMessage_EmptyGroupNameFilledByInboundMessage(t *testing.T)
 
 // --- Wiring: sendWhatsAppMessage must call the store (#674) ---
 
-// stubWhatsAppSend replaces the two points at which sendWhatsAppMessage
-// reaches WhatsApp, so the rest of the function — including the store write —
-// runs without a connection. The stub reports the given message ID and time.
-func stubWhatsAppSend(t *testing.T, msgID string, sentAt time.Time) {
-	t.Helper()
-	realConnected, realSend := clientIsConnected, clientSendMessage
-	t.Cleanup(func() { clientIsConnected, clientSendMessage = realConnected, realSend })
+// stubDelivery stands in for the whatsmeow client's delivery of a message, so
+// the rest of sendWhatsAppMessage — including the store write — runs without a
+// WhatsApp connection. It reports the given message ID and time, or the given
+// error. It holds no package state, so it is safe under parallel tests.
+type stubDelivery struct {
+	connected bool
+	id        string
+	sentAt    time.Time
+	err       error
 
-	clientIsConnected = func(*whatsmeow.Client) bool { return true }
-	clientSendMessage = func(*whatsmeow.Client, types.JID,
-		*waProto.Message) (whatsmeow.SendResponse, error) {
-		return whatsmeow.SendResponse{ID: msgID, Timestamp: sentAt}, nil
+	sentTo  types.JID
+	sentMsg *waProto.Message
+	calls   int
+}
+
+func (s *stubDelivery) IsConnected() bool { return s.connected }
+
+func (s *stubDelivery) SendMessage(_ context.Context, to types.JID, msg *waProto.Message,
+	_ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+	s.calls++
+	s.sentTo = to
+	s.sentMsg = msg
+	if s.err != nil {
+		return whatsmeow.SendResponse{}, s.err
 	}
+	return whatsmeow.SendResponse{ID: s.id, Timestamp: s.sentAt}, nil
+}
+
+// deliversAs returns a stub that reports a successful send.
+func deliversAs(msgID string, sentAt time.Time) *stubDelivery {
+	return &stubDelivery{connected: true, id: msgID, sentAt: sentAt}
 }
 
 // This is the regression guard for #674 itself: it fails if sendWhatsAppMessage
@@ -1604,8 +1625,10 @@ func stubWhatsAppSend(t *testing.T, msgID string, sentAt time.Time) {
 // group calls storeOutgoingMessage directly and would stay green if the two
 // were disconnected.
 func TestSendWhatsAppMessage_StoresTheSentMessage(t *testing.T) {
+	// The delivery seam is a parameter, not package state, so this is safe.
+	t.Parallel()
 	sentAt := time.Now().Truncate(time.Second)
-	stubWhatsAppSend(t, "wired-001", sentAt)
+	wa := deliversAs("wired-001", sentAt)
 
 	lidStore := &mockLIDStore{pnByLID: map[types.JID]types.JID{phoneLID: phonePN}}
 	client := newTestClientWithSelf(lidStore, phonePN)
@@ -1613,7 +1636,7 @@ func TestSendWhatsAppMessage_StoresTheSentMessage(t *testing.T) {
 
 	// Address the LID directly, so the send path's own phone-to-LID lookup —
 	// which would reach the network — is skipped.
-	ok, msg := sendWhatsAppMessage(client, ms, phoneLID.String(), "wired through to the store", "", testLogger())
+	ok, msg := sendWhatsAppMessage(client, wa, ms, phoneLID.String(), "wired through to the store", "", testLogger())
 	if !ok {
 		t.Fatalf("expected the send to succeed, got %q", msg)
 	}
@@ -1631,21 +1654,20 @@ func TestSendWhatsAppMessage_StoresTheSentMessage(t *testing.T) {
 	if row.sender != phonePN.User {
 		t.Errorf("expected sender %s, got %s", phonePN.User, row.sender)
 	}
+	if wa.calls != 1 {
+		t.Errorf("expected exactly one delivery, got %d", wa.calls)
+	}
 }
 
 // A send that fails must not leave a row behind.
 func TestSendWhatsAppMessage_FailedSendStoresNothing(t *testing.T) {
-	realConnected, realSend := clientIsConnected, clientSendMessage
-	t.Cleanup(func() { clientIsConnected, clientSendMessage = realConnected, realSend })
-	clientIsConnected = func(*whatsmeow.Client) bool { return true }
-	clientSendMessage = func(*whatsmeow.Client, types.JID, *waProto.Message) (whatsmeow.SendResponse, error) {
-		return whatsmeow.SendResponse{}, io.ErrUnexpectedEOF
-	}
-
+	// The delivery seam is a parameter, not package state, so this is safe.
+	t.Parallel()
+	wa := &stubDelivery{connected: true, err: io.ErrUnexpectedEOF}
 	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
 	ms := newTestMessageStore(t)
 
-	if ok, _ := sendWhatsAppMessage(client, ms, phoneLID.String(), "never delivered", "", testLogger()); ok {
+	if ok, _ := sendWhatsAppMessage(client, wa, ms, phoneLID.String(), "never delivered", "", testLogger()); ok {
 		t.Fatal("expected the send to report failure")
 	}
 	if count := queryMessageCount(ms, phonePN.String()); count != 0 {
@@ -1655,7 +1677,9 @@ func TestSendWhatsAppMessage_FailedSendStoresNothing(t *testing.T) {
 
 // A store failure must not turn a delivered message into a failed send.
 func TestSendWhatsAppMessage_StoreFailureStillReportsSuccess(t *testing.T) {
-	stubWhatsAppSend(t, "wired-002", time.Now())
+	// The delivery seam is a parameter, not package state, so this is safe.
+	t.Parallel()
+	wa := deliversAs("wired-002", time.Now())
 
 	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
 	ms := newTestMessageStore(t)
@@ -1664,7 +1688,7 @@ func TestSendWhatsAppMessage_StoreFailureStillReportsSuccess(t *testing.T) {
 		t.Fatalf("failed to close the test database: %v", err)
 	}
 
-	ok, msg := sendWhatsAppMessage(client, ms, phoneLID.String(), "delivered but unstorable", "", testLogger())
+	ok, msg := sendWhatsAppMessage(client, wa, ms, phoneLID.String(), "delivered but unstorable", "", testLogger())
 	if !ok {
 		t.Errorf("expected a delivered message to report success despite the store failure, got %q", msg)
 	}
