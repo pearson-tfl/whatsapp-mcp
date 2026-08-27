@@ -1557,11 +1557,19 @@ func TestStoreOutgoingMessage_UnseededGroup_MakesNoNetworkLookup(t *testing.T) {
 	}
 }
 
-// The empty name a first group send leaves behind must not be permanent: the
-// next inbound message from that group fills the real name in. This is why the
-// send stores an empty name rather than a generated one — GetChatName keeps an
-// existing name only when it is non-empty.
-func TestStoreOutgoingMessage_EmptyGroupNameFilledByInboundMessage(t *testing.T) {
+// outgoingChatName keeps a group name that is already stored, and the empty
+// name a first group send leaves behind does not block a later one from being
+// written. That is the contract this test covers, and all it covers: it writes
+// the second name through StoreChat rather than through an inbound message, so
+// it says nothing about what an inbound message would resolve the name to.
+//
+// It is also why the send stores an empty name rather than a generated one.
+// GetChatName keeps an existing name only when it is non-empty, so a generated
+// name would be permanent. An empty one can still be replaced — though not
+// necessarily by the real name: if the first inbound message's group-info
+// lookup fails, GetChatName writes its own "Group <id>" fallback, and that
+// then sticks.
+func TestStoreOutgoingMessage_KeepsExistingGroupName(t *testing.T) {
 	group := types.JID{User: "120363151143532472", Server: types.GroupServer}
 	ms := newTestMessageStore(t)
 
@@ -1573,15 +1581,15 @@ func TestStoreOutgoingMessage_EmptyGroupNameFilledByInboundMessage(t *testing.T)
 		t.Fatalf("expected an empty group name after the send, got %q", name)
 	}
 
-	// An inbound message from the same group, with a name already resolved
-	// into the chats row the way history sync or group info would supply it.
+	// A resolved name reaches the chats row. Written directly here, not
+	// through handleMessage — this test does not exercise the inbound path.
 	if err := ms.StoreChat(group.String(), "Family", time.Now()); err != nil {
 		t.Fatalf("failed to store the resolved chat name: %v", err)
 	}
 
 	client := newTestClient(&mockLIDStore{})
 	if name := outgoingChatName(client, ms, group, group.String(), testLogger()); name != "Family" {
-		t.Errorf("expected the filled-in name Family to be kept, got %q", name)
+		t.Errorf("expected the stored name Family to be kept, got %q", name)
 	}
 }
 

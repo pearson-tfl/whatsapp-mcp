@@ -1218,9 +1218,14 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 // which outlives the 60-second write timeout on this bridge's HTTP server. On
 // the post-send path that would let an already-delivered group message return
 // a failed response to the caller, inviting it to send a duplicate. So a group
-// we have never stored is filed with an empty name, and the first inbound
-// message from it fills the real name in — GetChatName only keeps an existing
-// name when that name is non-empty.
+// we have never stored is filed with an empty name, which a later inbound
+// message can replace: GetChatName keeps an existing name only when it is
+// non-empty, so a generated name here would be permanent instead.
+//
+// What replaces it is not guaranteed to be the group's real name. If the first
+// inbound message's group-info lookup fails, GetChatName writes its own
+// "Group <id>" fallback and that sticks. A group this bridge only ever sends
+// to keeps an empty name.
 //
 // The 1:1 branch stays on GetChatName: its contact lookup reads the local
 // whatsmeow store, not the network.
