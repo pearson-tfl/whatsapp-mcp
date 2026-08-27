@@ -669,9 +669,31 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
-// Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
-	if !client.IsConnected() {
+// whatsAppDelivery is the part of *whatsmeow.Client that sendWhatsAppMessage
+// uses to deliver a message. It is a seam: a test supplies its own
+// implementation and drives the rest of that function — including the store
+// write this ticket adds — with no WhatsApp connection, so a test fails if
+// that store write is ever disconnected from the send.
+//
+// It is a parameter rather than package state on purpose. A package-level
+// variable would work today, because no test in this package calls
+// t.Parallel(), but the first one that did would race silently. This is safe
+// whatever the tests do later. *whatsmeow.Client implements it as it stands.
+type whatsAppDelivery interface {
+	IsConnected() bool
+	SendMessage(ctx context.Context, to types.JID, message *waProto.Message,
+		extra ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
+}
+
+// Function to send a WhatsApp message.
+// messageStore and logger are used to write the sent message into the store,
+// so the bridge's own sends are on the record; see storeOutgoingMessage.
+// wa delivers the message; client is used for everything else — the LID
+// stores, contact lookups and media upload. In production both are the same
+// whatsmeow client.
+func sendWhatsAppMessage(client *whatsmeow.Client, wa whatsAppDelivery, messageStore *MessageStore,
+	recipient string, message string, mediaPath string, logger waLog.Logger) (bool, string) {
+	if !wa.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
 
@@ -695,6 +717,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			Server: "s.whatsapp.net", // For personal chats
 		}
 	}
+
+	// Keep the recipient JID as supplied, before the LID rewrite below. The
+	// store keys chats by phone JID, so this is the hint storeOutgoingMessage
+	// needs to file the sent message alongside received ones.
+	recipientHint := recipientJID.ToNonAD()
 
 	// For personal chats, resolve phone number JID to LID (Linked Identity).
 	// WhatsApp is migrating to LID-based addressing; messages sent to the
@@ -853,10 +880,18 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := wa.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// Record our own send. A store failure does not make a delivered message
+	// undelivered, so it is logged rather than reported as a send failure —
+	// the log stays the fallback record it is today.
+	if storeErr := storeOutgoingMessage(client, messageStore, recipientJID, recipientHint,
+		resp.ID, msg, resp.Timestamp, logger); storeErr != nil {
+		logger.Warnf("Message sent to %s but not stored: %v", recipient, storeErr)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -1173,6 +1208,119 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
+}
+
+// outgoingChatName returns the name to file a sent chat under, and makes no
+// network request in doing so.
+//
+// GetChatName asks the WhatsApp server for a group's name when that group is
+// not already in the store. whatsmeow gives that request a 75-second timeout,
+// which outlives the 60-second write timeout on this bridge's HTTP server. On
+// the post-send path that would let an already-delivered group message return
+// a failed response to the caller, inviting it to send a duplicate. So a group
+// we have never stored is filed with an empty name, which a later inbound
+// message can replace: GetChatName keeps an existing name only when it is
+// non-empty, so a generated name here would be permanent instead.
+//
+// What replaces it is not guaranteed to be the group's real name. If the first
+// inbound message's group-info lookup fails, GetChatName writes its own
+// "Group <id>" fallback and that sticks. A group this bridge only ever sends
+// to keeps an empty name.
+//
+// The 1:1 branch stays on GetChatName: its contact lookup reads the local
+// whatsmeow store, not the network.
+func outgoingChatName(client *whatsmeow.Client, messageStore *MessageStore, chat types.JID,
+	chatJID string, logger waLog.Logger) string {
+	if chat.Server == types.GroupServer {
+		// Keep a name we already have; otherwise leave it for an inbound
+		// message to fill in. GetChatName makes this same check, but reaching
+		// it would risk the group-info request described above.
+		var existing string
+		err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existing)
+		if err == nil {
+			return existing
+		}
+		return ""
+	}
+
+	// GetChatName's last-resort name for a 1:1 chat is the user-part it is
+	// handed. handleMessage hands it the message sender, which inbound is the
+	// peer. Here the sender is us, so hand it the chat's own user-part, or a
+	// brand-new chat would be named after our number instead of theirs.
+	return GetChatName(client, messageStore, chat, chatJID, nil, chat.User, logger)
+}
+
+// storeOutgoingMessage persists a message this bridge sent itself.
+//
+// WhatsApp echoes the user's sends from other devices back to this one as an
+// events.Message, which handleMessage stores. It does not echo a send back to
+// the device that made it, so messages posted through /api/send were delivered
+// but never written to messages.db — the store could not see what this bridge
+// had sent.
+//
+// This is the outbound twin of handleMessage and deliberately reuses the same
+// helpers, so a sent message lands in the store with the same chat JID, sender
+// and media columns a received one would.
+//
+// recipientHint is the recipient JID as the caller supplied it, before the
+// send path rewrote it to a LID. It plays the part RecipientAlt plays for an
+// echoed outgoing message: the phone JID that lets resolveLIDChat put sent and
+// received messages in one chat.
+func storeOutgoingMessage(client *whatsmeow.Client, messageStore *MessageStore, chat, recipientHint types.JID,
+	msgID string, msg *waProto.Message, timestamp time.Time, logger waLog.Logger) error {
+	if messageStore == nil {
+		return fmt.Errorf("no message store")
+	}
+	if msgID == "" {
+		return fmt.Errorf("no message ID")
+	}
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+
+	resolvedChat := resolveLIDChat(client, chat, types.EmptyJID, recipientHint, true)
+	chatJID := resolvedChat.String()
+
+	// The sender is us. There is no separate phone-JID hint to give: our own
+	// JID is the hint. An account whose Store.ID is itself a LID resolves
+	// through the LID store, which is resolveUserJID's remaining fallback.
+	var own types.JID
+	if client != nil && client.Store != nil && client.Store.ID != nil {
+		own = client.Store.ID.ToNonAD()
+	}
+	sender := resolveUserJID(client, own, types.EmptyJID).User
+
+	content := extractTextContent(msg)
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg, timestamp, msgID)
+
+	if content == "" && mediaType == "" {
+		return nil
+	}
+
+	name := outgoingChatName(client, messageStore, resolvedChat, chatJID, logger)
+	if err := messageStore.StoreChat(chatJID, name, timestamp); err != nil {
+		return fmt.Errorf("failed to store chat: %w", err)
+	}
+
+	if err := messageStore.StoreMessage(
+		msgID,
+		chatJID,
+		sender,
+		content,
+		timestamp,
+		true, // is_from_me: the bridge sent it
+		mediaType,
+		filename,
+		url,
+		mediaKey,
+		fileSHA256,
+		fileEncSHA256,
+		fileLength,
+	); err != nil {
+		return fmt.Errorf("failed to store message: %w", err)
+	}
+
+	return nil
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -1585,7 +1733,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, logger waLog.Logger) {
 	// Health check endpoint
 	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1630,7 +1778,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		// The client both delivers the message and backs the lookups.
+		success, message := sendWhatsAppMessage(client, client, messageStore,
+			req.Recipient, req.Message, req.MediaPath, logger)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -2113,7 +2263,7 @@ connectionSuccess:
 		}
 		port = v
 	}
-	startRESTServer(client, messageStore, port)
+	startRESTServer(client, messageStore, port, logger)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)

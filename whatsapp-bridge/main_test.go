@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -1137,5 +1138,566 @@ func TestCallChatJID_Precedence(t *testing.T) {
 				t.Errorf("callChatJID() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// --- Outbound persistence: storeOutgoingMessage (#674) ---
+//
+// Messages the bridge sends through /api/send are never echoed back to this
+// device, so handleMessage never sees them. These tests pin the outbound
+// twin that writes them, and check it files a sent message the same way an
+// equivalent received message would be filed.
+
+// outgoingRow is one messages row, read back for assertions.
+type outgoingRow struct {
+	sender    string
+	content   string
+	isFromMe  bool
+	mediaType string
+	filename  string
+	url       string
+	mediaKey  []byte
+}
+
+// queryOutgoingRow returns the row stored under a message ID.
+func queryOutgoingRow(t *testing.T, ms *MessageStore, msgID string) (outgoingRow, string) {
+	t.Helper()
+	var r outgoingRow
+	var chatJID string
+	err := ms.db.QueryRow(
+		"SELECT chat_jid, sender, content, is_from_me, media_type, filename, url, media_key FROM messages WHERE id = ?",
+		msgID,
+	).Scan(&chatJID, &r.sender, &r.content, &r.isFromMe, &r.mediaType, &r.filename, &r.url, &r.mediaKey)
+	if err != nil {
+		t.Fatalf("no message row for id %q: %v", msgID, err)
+	}
+	return r, chatJID
+}
+
+// textToSend builds the proto message sendWhatsAppMessage builds for a plain
+// text send.
+func textToSend(text string) *waProto.Message {
+	return &waProto.Message{Conversation: proto.String(text)}
+}
+
+// imageToSend builds the proto message sendWhatsAppMessage builds for an image
+// send, carrying the upload fields the CDN download path later needs.
+func imageToSend(caption string) *waProto.Message {
+	length := uint64(4096)
+	return &waProto.Message{
+		ImageMessage: &waProto.ImageMessage{
+			Caption:       proto.String(caption),
+			Mimetype:      proto.String("image/jpeg"),
+			URL:           proto.String("https://mmg.whatsapp.net/outgoing"),
+			MediaKey:      []byte("outgoing-media-key"),
+			FileSHA256:    []byte("sha"),
+			FileEncSHA256: []byte("encsha"),
+			FileLength:    &length,
+		},
+	}
+}
+
+// A send addressed to a LID must be stored under the phone JID, so a chat's
+// sent and received messages share one chat_jid.
+func TestStoreOutgoingMessage_LIDRecipient_StoredUnderPhoneJID(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
+	ms := newTestMessageStore(t)
+
+	err := storeOutgoingMessage(client, ms, phoneLID, phonePN, "out-001",
+		textToSend("Map digest 27 Jul"), time.Now(), testLogger())
+	if err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	row, chatJID := queryOutgoingRow(t, ms, "out-001")
+	if chatJID != phonePN.String() {
+		t.Errorf("expected chat_jid %s, got %s", phonePN, chatJID)
+	}
+	if !row.isFromMe {
+		t.Error("expected is_from_me to be true for a bridge send")
+	}
+	if row.content != "Map digest 27 Jul" {
+		t.Errorf("expected content to be the sent text, got %q", row.content)
+	}
+	if count := queryMessageCount(ms, phoneLID.String()); count != 0 {
+		t.Errorf("expected 0 messages under LID JID %s, got %d", phoneLID, count)
+	}
+}
+
+// The sender column must carry our own phone user-part, matching what
+// handleMessage stores for an outgoing message echoed from another device.
+func TestStoreOutgoingMessage_SenderIsOwnPhone(t *testing.T) {
+	self := types.JID{User: "447854069173", Server: types.DefaultUserServer}
+	client := newTestClientWithSelf(&mockLIDStore{}, self)
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(client, ms, phoneLID, phonePN, "out-002",
+		textToSend("hello"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	row, _ := queryOutgoingRow(t, ms, "out-002")
+	if row.sender != self.User {
+		t.Errorf("expected sender %s (own phone), got %s", self.User, row.sender)
+	}
+}
+
+// A send addressed to a plain phone JID passes through unchanged.
+func TestStoreOutgoingMessage_PhoneRecipient_Unaffected(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(client, ms, phonePN, phonePN, "out-003",
+		textToSend("plain"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	_, chatJID := queryOutgoingRow(t, ms, "out-003")
+	if chatJID != phonePN.String() {
+		t.Errorf("expected chat_jid %s, got %s", phonePN, chatJID)
+	}
+}
+
+// When the recipient hint is itself a LID, the whatsmeow LID store resolves
+// the chat — the same fallback the inbound path uses.
+func TestStoreOutgoingMessage_LIDWithStoreFallback(t *testing.T) {
+	lidStore := &mockLIDStore{pnByLID: map[types.JID]types.JID{phoneLID: phonePN}}
+	client := newTestClientWithSelf(lidStore, phonePN)
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(client, ms, phoneLID, phoneLID, "out-004",
+		textToSend("via store"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	_, chatJID := queryOutgoingRow(t, ms, "out-004")
+	if chatJID != phonePN.String() {
+		t.Errorf("expected chat_jid %s from LID store, got %s", phonePN, chatJID)
+	}
+}
+
+// A media send stores the caption as content and the upload fields as media
+// columns, so the media stays downloadable from the store afterwards.
+func TestStoreOutgoingMessage_MediaColumnsPersisted(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(client, ms, phonePN, phonePN, "out-005",
+		imageToSend("chart for John"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	row, _ := queryOutgoingRow(t, ms, "out-005")
+	if row.content != "chart for John" {
+		t.Errorf("expected the caption as content, got %q", row.content)
+	}
+	if row.mediaType != "image" {
+		t.Errorf("expected media_type image, got %q", row.mediaType)
+	}
+	if row.filename == "" {
+		t.Error("expected a filename to be generated for the sent image")
+	}
+	if row.url != "https://mmg.whatsapp.net/outgoing" {
+		t.Errorf("expected the upload URL to be stored, got %q", row.url)
+	}
+	if string(row.mediaKey) != "outgoing-media-key" {
+		t.Errorf("expected the media key to be stored, got %q", row.mediaKey)
+	}
+}
+
+// Sending must move the chat's last_message_time forward, as receiving does.
+func TestStoreOutgoingMessage_UpdatesChatLastMessageTime(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
+	ms := newTestMessageStore(t)
+
+	earlier := time.Now().Add(-time.Hour)
+	if err := ms.StoreChat(phonePN.String(), "Ben", earlier); err != nil {
+		t.Fatalf("failed to seed chat: %v", err)
+	}
+	before, _ := queryChatLastMessageTime(ms, phonePN.String())
+
+	if err := storeOutgoingMessage(client, ms, phonePN, phonePN, "out-006",
+		textToSend("later"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	after, found := queryChatLastMessageTime(ms, phonePN.String())
+	if !found {
+		t.Fatal("chat row missing after send")
+	}
+	if after == before {
+		t.Error("expected last_message_time to move forward after a send")
+	}
+	// The existing chat name must survive the send.
+	if name, _ := queryChat(ms, phonePN.String()); name != "Ben" {
+		t.Errorf("expected chat name Ben to be preserved, got %q", name)
+	}
+}
+
+// A send with neither text nor media writes nothing and reports no error.
+func TestStoreOutgoingMessage_EmptyMessageNotStored(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(client, ms, phonePN, phonePN, "out-007",
+		textToSend(""), time.Now(), testLogger()); err != nil {
+		t.Fatalf("expected no error for an empty message, got %v", err)
+	}
+
+	if count := queryMessageCount(ms, phonePN.String()); count != 0 {
+		t.Errorf("expected 0 messages stored for an empty send, got %d", count)
+	}
+}
+
+// A missing message ID is reported rather than written as a blank-keyed row.
+func TestStoreOutgoingMessage_MissingIDIsReported(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(client, ms, phonePN, phonePN, "",
+		textToSend("no id"), time.Now(), testLogger()); err == nil {
+		t.Error("expected an error when the send returned no message ID")
+	}
+	if count := queryMessageCount(ms, phonePN.String()); count != 0 {
+		t.Errorf("expected nothing stored without a message ID, got %d rows", count)
+	}
+}
+
+// TestStoreOutgoingMessage_WritesToRealMessagesDB runs the outbound write
+// against a real on-disk messages.db built by NewMessageStore, not the
+// hand-copied schema newTestMessageStore uses. It is the disk-level proof
+// that a bridge send lands as a row in the production schema, and it catches
+// drift between the two schemas.
+func TestStoreOutgoingMessage_WritesToRealMessagesDB(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	ms, err := NewMessageStore()
+	if err != nil {
+		t.Fatalf("NewMessageStore failed: %v", err)
+	}
+	t.Cleanup(func() { _ = ms.Close() })
+
+	sent := time.Now().UTC().Truncate(time.Second)
+	if err := storeOutgoingMessage(newTestClientWithSelf(&mockLIDStore{}, phonePN), ms,
+		phoneLID, phonePN, "disk-001", textToSend("outbound on the record"), sent, testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	if _, statErr := os.Stat(filepath.Join("store", "messages.db")); statErr != nil {
+		t.Fatalf("expected store/messages.db on disk: %v", statErr)
+	}
+
+	// Read back through a second connection to the same file, so the
+	// assertion cannot pass on in-process state alone.
+	db, err := sql.Open("sqlite3", "file:store/messages.db?mode=ro")
+	if err != nil {
+		t.Fatalf("failed to reopen messages.db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var chatJID, sender, content string
+	var isFromMe bool
+	if err := db.QueryRow(
+		"SELECT chat_jid, sender, content, is_from_me FROM messages WHERE id = ?", "disk-001",
+	).Scan(&chatJID, &sender, &content, &isFromMe); err != nil {
+		t.Fatalf("sent message not found in messages.db: %v", err)
+	}
+
+	if chatJID != phonePN.String() {
+		t.Errorf("expected chat_jid %s, got %s", phonePN, chatJID)
+	}
+	if sender != phonePN.User {
+		t.Errorf("expected sender %s, got %s", phonePN.User, sender)
+	}
+	if content != "outbound on the record" {
+		t.Errorf("expected the sent text as content, got %q", content)
+	}
+	if !isFromMe {
+		t.Error("expected is_from_me to be true")
+	}
+}
+
+// A first send to a contact the store has never seen must name the chat after
+// the recipient. GetChatName's last-resort name is the user-part it is handed,
+// and for an outbound message the sender is us, so handing it the sender would
+// name the chat after our own number.
+func TestStoreOutgoingMessage_NewChatNamedAfterRecipient(t *testing.T) {
+	self := types.JID{User: "447854069173", Server: types.DefaultUserServer}
+	client := newTestClientWithSelf(&mockLIDStore{}, self)
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(client, ms, phoneLID, phonePN, "out-008",
+		textToSend("first contact"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	name, found := queryChat(ms, phonePN.String())
+	if !found {
+		t.Fatal("expected a chat row for the recipient")
+	}
+	if name == self.User {
+		t.Errorf("chat named after our own number %s, expected the recipient", self.User)
+	}
+	if name != phonePN.User {
+		t.Errorf("expected chat name %s (the recipient), got %q", phonePN.User, name)
+	}
+}
+
+// An account whose own Store.ID is a LID must still store the phone user-part
+// as the sender, resolved through the LID store.
+func TestStoreOutgoingMessage_OwnLIDSenderResolvedViaStore(t *testing.T) {
+	ownLID := types.JID{User: "999888777666555", Server: types.HiddenUserServer}
+	ownPN := types.JID{User: "447854069173", Server: types.DefaultUserServer}
+	lidStore := &mockLIDStore{pnByLID: map[types.JID]types.JID{ownLID: ownPN}}
+
+	client := newTestClient(lidStore)
+	id := ownLID.ToNonAD()
+	client.Store.ID = &id
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(client, ms, phonePN, phonePN, "out-009",
+		textToSend("from a LID account"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	row, _ := queryOutgoingRow(t, ms, "out-009")
+	if row.sender != ownPN.User {
+		t.Errorf("expected sender %s resolved from the LID store, got %s", ownPN.User, row.sender)
+	}
+}
+
+// An account whose own Store.ID is a LID the store cannot map keeps the LID
+// user-part rather than storing an empty sender.
+func TestStoreOutgoingMessage_OwnLIDWithoutMappingKeepsLID(t *testing.T) {
+	ownLID := types.JID{User: "999888777666555", Server: types.HiddenUserServer}
+	client := newTestClient(&mockLIDStore{})
+	id := ownLID.ToNonAD()
+	client.Store.ID = &id
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(client, ms, phonePN, phonePN, "out-010",
+		textToSend("unmapped LID account"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	row, _ := queryOutgoingRow(t, ms, "out-010")
+	if row.sender != ownLID.User {
+		t.Errorf("expected sender to fall back to the LID user-part %s, got %s", ownLID.User, row.sender)
+	}
+}
+
+// A group send stores under the group JID untouched — the LID rewrite that
+// applies to 1:1 recipients must not touch a group. The chat is seeded with a
+// name so GetChatName short-circuits and the test needs no connection.
+func TestStoreOutgoingMessage_GroupSendStoredUnderGroupJID(t *testing.T) {
+	group := types.JID{User: "120363151143532472", Server: types.GroupServer}
+	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
+	ms := newTestMessageStore(t)
+
+	if err := ms.StoreChat(group.String(), "Family", time.Now().Add(-time.Hour)); err != nil {
+		t.Fatalf("failed to seed group chat: %v", err)
+	}
+
+	if err := storeOutgoingMessage(client, ms, group, group, "out-011",
+		textToSend("group digest"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	row, chatJID := queryOutgoingRow(t, ms, "out-011")
+	if chatJID != group.String() {
+		t.Errorf("expected chat_jid %s, got %s", group, chatJID)
+	}
+	if !row.isFromMe {
+		t.Error("expected is_from_me to be true for a group send")
+	}
+	if row.sender != phonePN.User {
+		t.Errorf("expected sender %s, got %s", phonePN.User, row.sender)
+	}
+	if name, _ := queryChat(ms, group.String()); name != "Family" {
+		t.Errorf("expected the group name Family to be preserved, got %q", name)
+	}
+}
+
+// A send to a group the store has never seen must not make a network request.
+// GetGroupInfo carries whatsmeow's 75-second request timeout, which outlives
+// the 60-second HTTP write timeout on /api/send, so a delivered group message
+// could return a failure to the caller and invite a duplicate send.
+//
+// The client is nil on purpose, as a tripwire: if this path ever regains a
+// client call, it will panic here rather than pass quietly. That is less than
+// proof of absence — the group branch returns before touching the client at
+// all, so the nil is never dereferenced either way, and it relies on whatsmeow
+// methods panicking on a nil receiver. A name assertion alone would prove even
+// less, because GetChatName on a disconnected client also falls back to a
+// generated name.
+func TestStoreOutgoingMessage_UnseededGroup_MakesNoNetworkLookup(t *testing.T) {
+	group := types.JID{User: "120363151143532472", Server: types.GroupServer}
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(nil, ms, group, group, "out-012",
+		textToSend("first group send"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+
+	row, chatJID := queryOutgoingRow(t, ms, "out-012")
+	if chatJID != group.String() {
+		t.Errorf("expected chat_jid %s, got %s", group, chatJID)
+	}
+	if !row.isFromMe {
+		t.Error("expected is_from_me to be true for a group send")
+	}
+
+	// The name is left empty so a later inbound message can fill it in.
+	name, found := queryChat(ms, group.String())
+	if !found {
+		t.Fatal("expected a chat row for the group")
+	}
+	if name != "" {
+		t.Errorf("expected an empty group name pending an inbound message, got %q", name)
+	}
+}
+
+// outgoingChatName keeps a group name that is already stored, and the empty
+// name a first group send leaves behind does not block a later one from being
+// written. That is the contract this test covers, and all it covers: it writes
+// the second name through StoreChat rather than through an inbound message, so
+// it says nothing about what an inbound message would resolve the name to.
+//
+// It is also why the send stores an empty name rather than a generated one.
+// GetChatName keeps an existing name only when it is non-empty, so a generated
+// name would be permanent. An empty one can still be replaced — though not
+// necessarily by the real name: if the first inbound message's group-info
+// lookup fails, GetChatName writes its own "Group <id>" fallback, and that
+// then sticks.
+func TestStoreOutgoingMessage_KeepsExistingGroupName(t *testing.T) {
+	group := types.JID{User: "120363151143532472", Server: types.GroupServer}
+	ms := newTestMessageStore(t)
+
+	if err := storeOutgoingMessage(nil, ms, group, group, "out-013",
+		textToSend("first group send"), time.Now(), testLogger()); err != nil {
+		t.Fatalf("storeOutgoingMessage returned error: %v", err)
+	}
+	if name, _ := queryChat(ms, group.String()); name != "" {
+		t.Fatalf("expected an empty group name after the send, got %q", name)
+	}
+
+	// A resolved name reaches the chats row. Written directly here, not
+	// through handleMessage — this test does not exercise the inbound path.
+	if err := ms.StoreChat(group.String(), "Family", time.Now()); err != nil {
+		t.Fatalf("failed to store the resolved chat name: %v", err)
+	}
+
+	client := newTestClient(&mockLIDStore{})
+	if name := outgoingChatName(client, ms, group, group.String(), testLogger()); name != "Family" {
+		t.Errorf("expected the stored name Family to be kept, got %q", name)
+	}
+}
+
+// --- Wiring: sendWhatsAppMessage must call the store (#674) ---
+
+// stubDelivery stands in for the whatsmeow client's delivery of a message, so
+// the rest of sendWhatsAppMessage — including the store write — runs without a
+// WhatsApp connection. It reports the given message ID and time, or the given
+// error. It holds no package state, so it is safe under parallel tests.
+type stubDelivery struct {
+	connected bool
+	id        string
+	sentAt    time.Time
+	err       error
+
+	sentTo  types.JID
+	sentMsg *waProto.Message
+	calls   int
+}
+
+func (s *stubDelivery) IsConnected() bool { return s.connected }
+
+func (s *stubDelivery) SendMessage(_ context.Context, to types.JID, msg *waProto.Message,
+	_ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+	s.calls++
+	s.sentTo = to
+	s.sentMsg = msg
+	if s.err != nil {
+		return whatsmeow.SendResponse{}, s.err
+	}
+	return whatsmeow.SendResponse{ID: s.id, Timestamp: s.sentAt}, nil
+}
+
+// deliversAs returns a stub that reports a successful send.
+func deliversAs(msgID string, sentAt time.Time) *stubDelivery {
+	return &stubDelivery{connected: true, id: msgID, sentAt: sentAt}
+}
+
+// This is the regression guard for #674 itself: it fails if sendWhatsAppMessage
+// ever stops writing what it sent into the store. Every other test in this
+// group calls storeOutgoingMessage directly and would stay green if the two
+// were disconnected.
+func TestSendWhatsAppMessage_StoresTheSentMessage(t *testing.T) {
+	// The delivery seam is a parameter, not package state, so this is safe.
+	t.Parallel()
+	sentAt := time.Now().Truncate(time.Second)
+	wa := deliversAs("wired-001", sentAt)
+
+	lidStore := &mockLIDStore{pnByLID: map[types.JID]types.JID{phoneLID: phonePN}}
+	client := newTestClientWithSelf(lidStore, phonePN)
+	ms := newTestMessageStore(t)
+
+	// Address the LID directly, so the send path's own phone-to-LID lookup —
+	// which would reach the network — is skipped.
+	ok, msg := sendWhatsAppMessage(client, wa, ms, phoneLID.String(), "wired through to the store", "", testLogger())
+	if !ok {
+		t.Fatalf("expected the send to succeed, got %q", msg)
+	}
+
+	row, chatJID := queryOutgoingRow(t, ms, "wired-001")
+	if chatJID != phonePN.String() {
+		t.Errorf("expected chat_jid %s, got %s", phonePN, chatJID)
+	}
+	if row.content != "wired through to the store" {
+		t.Errorf("expected the sent text as content, got %q", row.content)
+	}
+	if !row.isFromMe {
+		t.Error("expected is_from_me to be true")
+	}
+	if row.sender != phonePN.User {
+		t.Errorf("expected sender %s, got %s", phonePN.User, row.sender)
+	}
+	if wa.calls != 1 {
+		t.Errorf("expected exactly one delivery, got %d", wa.calls)
+	}
+}
+
+// A send that fails must not leave a row behind.
+func TestSendWhatsAppMessage_FailedSendStoresNothing(t *testing.T) {
+	// The delivery seam is a parameter, not package state, so this is safe.
+	t.Parallel()
+	wa := &stubDelivery{connected: true, err: io.ErrUnexpectedEOF}
+	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
+	ms := newTestMessageStore(t)
+
+	if ok, _ := sendWhatsAppMessage(client, wa, ms, phoneLID.String(), "never delivered", "", testLogger()); ok {
+		t.Fatal("expected the send to report failure")
+	}
+	if count := queryMessageCount(ms, phonePN.String()); count != 0 {
+		t.Errorf("expected nothing stored for a failed send, got %d rows", count)
+	}
+}
+
+// A store failure must not turn a delivered message into a failed send.
+func TestSendWhatsAppMessage_StoreFailureStillReportsSuccess(t *testing.T) {
+	// The delivery seam is a parameter, not package state, so this is safe.
+	t.Parallel()
+	wa := deliversAs("wired-002", time.Now())
+
+	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
+	ms := newTestMessageStore(t)
+	// Close the database so every write fails.
+	if err := ms.db.Close(); err != nil {
+		t.Fatalf("failed to close the test database: %v", err)
+	}
+
+	ok, msg := sendWhatsAppMessage(client, wa, ms, phoneLID.String(), "delivered but unstorable", "", testLogger())
+	if !ok {
+		t.Errorf("expected a delivered message to report success despite the store failure, got %q", msg)
 	}
 }
