@@ -29,11 +29,19 @@ import (
 type mockLIDStore struct {
 	store.NoopStore
 	pnByLID map[types.JID]types.JID
+	lidByPN map[types.JID]types.JID
 }
 
 func (m *mockLIDStore) GetPNForLID(_ context.Context, lid types.JID) (types.JID, error) {
 	if pn, ok := m.pnByLID[lid]; ok {
 		return pn, nil
+	}
+	return types.EmptyJID, nil
+}
+
+func (m *mockLIDStore) GetLIDForPN(_ context.Context, pn types.JID) (types.JID, error) {
+	if lid, ok := m.lidByPN[pn]; ok {
+		return lid, nil
 	}
 	return types.EmptyJID, nil
 }
@@ -1699,5 +1707,49 @@ func TestSendWhatsAppMessage_StoreFailureStillReportsSuccess(t *testing.T) {
 	ok, msg := sendWhatsAppMessage(client, wa, ms, phoneLID.String(), "delivered but unstorable", "", testLogger())
 	if !ok {
 		t.Errorf("expected a delivered message to report success despite the store failure, got %q", msg)
+	}
+}
+
+// --- Media-retry participant JID (#131) ---
+
+// A group media-retry receipt must name the sender by the LID the group addresses
+// them with. The messages table stores a bare phone user-part, so the LID has to be
+// recovered from the LID-PN store.
+func TestRetryParticipantJID_BarePhoneResolvesToLID(t *testing.T) {
+	client := newTestClient(&mockLIDStore{
+		lidByPN: map[types.JID]types.JID{phonePN: phoneLID},
+	})
+
+	got := retryParticipantJID(client, phonePN.User)
+
+	if got != phoneLID {
+		t.Errorf("participant JID = %q, want peer LID %q", got.String(), phoneLID.String())
+	}
+}
+
+// Without a LID mapping the participant must still be a routable phone JID. A bare
+// user-part is not: types.ParseJID puts it in the server slot and returns no error,
+// which encodes as a JID pair with an empty user that the server cannot route.
+func TestRetryParticipantJID_NoLIDMappingFallsBackToPhoneJID(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+
+	got := retryParticipantJID(client, phonePN.User)
+
+	if got != phonePN {
+		t.Errorf("participant JID = %q, want phone JID %q", got.String(), phonePN.String())
+	}
+}
+
+// A sender that already carries a server is passed through the same LID lookup, so
+// a legacy row storing a full JID resolves the same way as a bare user-part.
+func TestRetryParticipantJID_QualifiedPhoneJIDResolvesToLID(t *testing.T) {
+	client := newTestClient(&mockLIDStore{
+		lidByPN: map[types.JID]types.JID{phonePN: phoneLID},
+	})
+
+	got := retryParticipantJID(client, phonePN.String())
+
+	if got != phoneLID {
+		t.Errorf("participant JID = %q, want peer LID %q", got.String(), phoneLID.String())
 	}
 }

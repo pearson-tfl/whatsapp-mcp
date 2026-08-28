@@ -1617,12 +1617,42 @@ func requestMediaRetry(client *whatsmeow.Client, chatJID, messageID, sender stri
 			IsGroup:  chat.Server == types.GroupServer,
 		},
 	}
-	if info.IsGroup && sender != "" {
-		if senderJID, perr := types.ParseJID(sender); perr == nil {
-			info.Sender = senderJID
-		}
+	if info.IsGroup {
+		info.Sender = retryParticipantJID(client, sender)
 	}
 	return client.SendMediaRetryReceipt(context.Background(), info, mediaKey)
+}
+
+// retryParticipantJID resolves the sender recorded in the messages table to the JID
+// a media-retry receipt must carry in its `participant` attribute. Only group
+// receipts carry one (SendMediaRetryReceipt sets it under `if message.IsGroup`),
+// which is why direct-chat downloads were unaffected.
+func retryParticipantJID(client *whatsmeow.Client, sender string) types.JID {
+	if sender == "" {
+		return types.EmptyJID
+	}
+	// The messages table stores a bare user-part (handleMessage keeps only
+	// resolvedSender.User). types.ParseJID on a string with no "@" returns
+	// JID{User: "", Server: sender} and no error, which the binary encoder writes as
+	// a JID pair with an empty user — a participant the server cannot route, so the
+	// re-upload request goes unanswered. Supply the phone server here instead.
+	pn, err := types.ParseJID(sender)
+	if err != nil {
+		return types.EmptyJID
+	}
+	if pn.User == "" {
+		pn = types.NewJID(sender, types.DefaultUserServer)
+	}
+	pn = pn.ToNonAD()
+	// Groups address participants by LID. whatsmeow prefers the LID whenever the
+	// LID-PN store knows one (see decryptMessages in message.go and the retry-receipt
+	// handler in retry.go); do the same, and keep the phone JID when it does not.
+	if pn.Server == types.DefaultUserServer && client != nil && client.Store != nil && client.Store.LIDs != nil {
+		if lid, lerr := client.Store.LIDs.GetLIDForPN(context.Background(), pn); lerr == nil && !lid.IsEmpty() {
+			return lid.ToNonAD()
+		}
+	}
+	return pn
 }
 
 // handleMediaRetry processes a media re-upload notification triggered by requestMediaRetry.
