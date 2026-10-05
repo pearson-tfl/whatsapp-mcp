@@ -1937,3 +1937,49 @@ func TestSendGuard_NoHomeFolder_RefusesEverySend(t *testing.T) {
 		t.Errorf("status = %d, delivered = %v; want 403 and nothing delivered", status, delivered)
 	}
 }
+
+// A recipient is caller-supplied, so a newline in it must not split the
+// refusal into two log lines: the second could pass for one the bridge wrote.
+func TestSendGuard_RecipientWithNewline_LoggedAsOneLine(t *testing.T) {
+	withSendToken(t, []byte(testSendToken))
+	logger := newRecordingLogger()
+	srv := httptest.NewServer(sendHandler(loadSendGuard(logger), func(string, string, string) (bool, string) {
+		return true, "sent"
+	}, logger))
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL, "application/json",
+		strings.NewReader(`{"recipient":"447700900000\nINFO forged line","message":"hello"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	if !logger.logged("refused: no gate token", "447700900000") {
+		t.Fatalf("no refusal line naming the recipient was logged; got %q", *logger.lines)
+	}
+	for _, line := range *logger.lines {
+		if strings.Contains(line, "\n") {
+			t.Errorf("logged line holds a raw newline: %q", line)
+		}
+	}
+}
+
+// The mux the bridge serves must guard /api/send: every other guard test calls
+// sendHandler directly, so this is what fails if the wiring loses the guard.
+func TestRESTMux_SendWithoutGateToken_Refused(t *testing.T) {
+	withSendToken(t, []byte(testSendToken))
+	srv := httptest.NewServer(newRESTMux(nil, nil, newRecordingLogger()))
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/api/send", "application/json",
+		strings.NewReader(`{"recipient":"120363000000000000@g.us","message":"hello"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d; want 403", resp.StatusCode)
+	}
+}

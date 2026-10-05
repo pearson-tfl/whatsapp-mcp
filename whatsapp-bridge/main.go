@@ -1836,7 +1836,7 @@ func sendHandler(guard sendGuard, send func(recipient, message, mediaPath string
 		}
 
 		if !guard.allows(r) {
-			logger.Warnf("%s send to %s refused: no gate token",
+			logger.Warnf("%s send to %q refused: no gate token",
 				time.Now().UTC().Format(time.RFC3339), req.Recipient)
 			http.Error(w, "Send refused: no gate token", http.StatusForbidden)
 			return
@@ -1874,10 +1874,13 @@ func sendHandler(guard sendGuard, send func(recipient, message, mediaPath string
 	}
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, logger waLog.Logger) {
+// newRESTMux builds the routes startRESTServer serves, guard included, so a
+// test can drive them exactly as the bridge does.
+func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) *http.ServeMux {
+	mux := http.NewServeMux()
+
 	// Health check endpoint
-	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		status := map[string]interface{}{
 			"status":    "ok",
@@ -1893,13 +1896,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for sending messages
 	guard := loadSendGuard(logger)
-	http.HandleFunc("/api/send", sendHandler(guard, func(recipient, message, mediaPath string) (bool, string) {
+	mux.HandleFunc("/api/send", sendHandler(guard, func(recipient, message, mediaPath string) (bool, string) {
 		// The client both delivers the message and backs the lookups.
 		return sendWhatsAppMessage(client, client, messageStore, recipient, message, mediaPath, logger)
 	}, logger))
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1964,7 +1967,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for sending typing indicator
-	http.HandleFunc("/api/typing", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/typing", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -2039,6 +2042,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 	})
 
+	return mux
+}
+
+// Start a REST API server to expose the WhatsApp client functionality
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, logger waLog.Logger) {
 	// Start the server with proper timeouts. Bind to loopback so the bridge is
 	// not reachable from the LAN; MCP clients talk to it over localhost.
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
@@ -2047,6 +2055,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	// Create server with timeouts for stability
 	server := &http.Server{
 		Addr:         serverAddr,
+		Handler:      newRESTMux(client, messageStore, logger),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second, // Longer for media downloads
 		IdleTimeout:  120 * time.Second,
