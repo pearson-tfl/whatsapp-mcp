@@ -228,6 +228,10 @@ def _resolve_name_from_whatsmeow(jid: str) -> str | None:
 
 
 def get_sender_name(sender_jid: str) -> str:
+    # The bridge stores an empty sender when a history-synced group message names
+    # no participant; the LIKE lookup below would match every chat.
+    if not sender_jid:
+        return sender_jid
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()

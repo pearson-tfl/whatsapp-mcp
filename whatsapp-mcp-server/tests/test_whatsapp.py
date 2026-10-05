@@ -1,8 +1,10 @@
 """Tests for WhatsApp MCP server functions."""
 
+import sqlite3
 from datetime import datetime
 
-from whatsapp import Chat, Contact, Message, chat_to_dict, contact_to_dict, msg_to_dict
+import whatsapp
+from whatsapp import Chat, Contact, Message, chat_to_dict, contact_to_dict, get_sender_name, msg_to_dict
 
 
 class TestMessageConversion:
@@ -142,3 +144,20 @@ class TestContactConversion:
         result = contact_to_dict(contact)
 
         assert result["name"] is None
+
+
+class TestGetSenderName:
+    """Tests for sender-name resolution against messages.db."""
+
+    def test_empty_sender_matches_no_chat(self, tmp_path, monkeypatch):
+        """An empty sender names nobody; the fuzzy LIKE lookup must not match every chat."""
+        db = tmp_path / "messages.db"
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP)")
+        conn.execute("INSERT INTO chats VALUES ('1234567890@s.whatsapp.net', 'John Doe', NULL)")
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(whatsapp, "MESSAGES_DB_PATH", str(db))
+        monkeypatch.setattr(whatsapp, "WHATSMEOW_DB_PATH", str(tmp_path / "absent.db"))
+
+        assert get_sender_name("") == ""
