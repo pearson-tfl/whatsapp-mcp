@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"math"
 	"math/rand"
 	"net/http"
@@ -1762,6 +1764,116 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// sendTokenFile is where the PM approval gate keeps the send token, relative
+// to the home folder: the gate's own state folder, outside git (#1820).
+const sendTokenFile = ".local/state/signal-whatsapp-poll/send-token"
+
+// sendTokenHeader carries the send token on a request to /api/send.
+const sendTokenHeader = "X-Signal-Send-Token"
+
+// sendGuard decides whether /api/send accepts a request (#1820): only a send
+// that carries the approval gate's token is delivered. It is off until the
+// gate's token file exists, so the bridge and the gate can switch over in
+// either order. On with no token, it refuses every send.
+type sendGuard struct {
+	on    bool
+	token []byte
+}
+
+// loadSendGuard reads the token file once, at start, and logs which way the
+// guard is set.
+func loadSendGuard(logger waLog.Logger) sendGuard {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		logger.Errorf("Send guard on, every send refused: no home folder to find the token file in: %v", err)
+		return sendGuard{on: true}
+	}
+	path := filepath.Join(home, sendTokenFile)
+	token, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		logger.Warnf("Send guard off: no token file at %s, so /api/send accepts any local caller", path)
+		return sendGuard{}
+	}
+	if err != nil {
+		logger.Errorf("Send guard on, every send refused: cannot read %s: %v", path, err)
+		return sendGuard{on: true}
+	}
+	token = bytes.TrimSpace(token)
+	if len(token) == 0 {
+		logger.Errorf("Send guard on, every send refused: %s is empty", path)
+		return sendGuard{on: true}
+	}
+	logger.Infof("Send guard on: /api/send needs the %s header", sendTokenHeader)
+	return sendGuard{on: true, token: token}
+}
+
+// allows reports whether r carries the gate's token. The compare is in
+// constant time; an empty header never matches, even an empty token.
+func (g sendGuard) allows(r *http.Request) bool {
+	if !g.on {
+		return true
+	}
+	got := r.Header.Get(sendTokenHeader)
+	return got != "" && subtle.ConstantTimeCompare([]byte(got), g.token) == 1
+}
+
+// sendHandler serves /api/send. send delivers the message; in production it
+// is sendWhatsAppMessage on the live client.
+func sendHandler(guard sendGuard, send func(recipient, message, mediaPath string) (bool, string),
+	logger waLog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Only allow POST requests
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Parse the request body
+		var req SendMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if !guard.allows(r) {
+			logger.Warnf("%s send to %s refused: no gate token",
+				time.Now().UTC().Format(time.RFC3339), req.Recipient)
+			http.Error(w, "Send refused: no gate token", http.StatusForbidden)
+			return
+		}
+
+		// Validate request
+		if req.Recipient == "" {
+			http.Error(w, "Recipient is required", http.StatusBadRequest)
+			return
+		}
+
+		if req.Message == "" && req.MediaPath == "" {
+			http.Error(w, "Message or media path is required", http.StatusBadRequest)
+			return
+		}
+
+		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+
+		// Send the message
+		success, message := send(req.Recipient, req.Message, req.MediaPath)
+		fmt.Println("Message sent", success, message)
+		// Set response headers
+		w.Header().Set("Content-Type", "application/json")
+
+		// Set appropriate status code
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		// Send response
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: success,
+			Message: message,
+		})
+	}
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, logger waLog.Logger) {
 	// Health check endpoint
@@ -1780,52 +1892,11 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
-		// Only allow POST requests
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Parse the request body
-		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "Invalid request format", http.StatusBadRequest)
-			return
-		}
-
-		// Validate request
-		if req.Recipient == "" {
-			http.Error(w, "Recipient is required", http.StatusBadRequest)
-			return
-		}
-
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
-			return
-		}
-
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
-
-		// Send the message
+	guard := loadSendGuard(logger)
+	http.HandleFunc("/api/send", sendHandler(guard, func(recipient, message, mediaPath string) (bool, string) {
 		// The client both delivers the message and backs the lookups.
-		success, message := sendWhatsAppMessage(client, client, messageStore,
-			req.Recipient, req.Message, req.MediaPath, logger)
-		fmt.Println("Message sent", success, message)
-		// Set response headers
-		w.Header().Set("Content-Type", "application/json")
-
-		// Set appropriate status code
-		if !success {
-			w.WriteHeader(http.StatusInternalServerError)
-		}
-
-		// Send response
-		_ = json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
-		})
-	})
+		return sendWhatsAppMessage(client, client, messageStore, recipient, message, mediaPath, logger)
+	}, logger))
 
 	// Handler for downloading media
 	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {

@@ -272,6 +272,10 @@ Copy `.env.example` to `.env` and configure as needed:
 | `WHATSMEOW_DB_PATH`    | `../whatsapp-bridge/store/whatsapp.db`   | whatsmeow DB used for LID ↔ phone resolution |
 | `WHATSAPP_API_URL`     | `http://localhost:8080/api`              | Go bridge REST API URL                       |
 
+### Send guard (Go bridge)
+
+If the file `~/.local/state/signal-whatsapp-poll/send-token` exists when the bridge starts, `/api/send` delivers only a request whose `X-Signal-Send-Token` header matches the file's contents (surrounding whitespace trimmed). Any other send gets HTTP 403 and a log line naming the recipient. An empty or unreadable file refuses every send. With no file the guard is off and `/api/send` works as before. Only `/api/send` is guarded; receiving and the other endpoints are unchanged. The file is read once at start, so restart the bridge after creating or changing it. While the guard is on, the MCP server's send tools (`send_message`, `send_file`, `send_audio_message`) are refused, because they do not send the header.
+
 ### CLI flags (Go bridge)
 
 | Flag                  | Default | Description                                                                                                                                                                                                                                                       |

@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1751,5 +1753,187 @@ func TestRetryParticipantJID_QualifiedPhoneJIDResolvesToLID(t *testing.T) {
 
 	if got != phoneLID {
 		t.Errorf("participant JID = %q, want peer LID %q", got.String(), phoneLID.String())
+	}
+}
+
+// --- /api/send guard (#1820) ---
+
+// recordingLogger keeps every line logged through it, so a test can show that a
+// refusal was logged.
+type recordingLogger struct{ lines *[]string }
+
+func newRecordingLogger() recordingLogger { return recordingLogger{lines: &[]string{}} }
+
+func (l recordingLogger) add(level, msg string, args ...interface{}) {
+	*l.lines = append(*l.lines, level+" "+fmt.Sprintf(msg, args...))
+}
+func (l recordingLogger) Debugf(msg string, args ...interface{}) { l.add("DEBUG", msg, args...) }
+func (l recordingLogger) Infof(msg string, args ...interface{})  { l.add("INFO", msg, args...) }
+func (l recordingLogger) Warnf(msg string, args ...interface{})  { l.add("WARN", msg, args...) }
+func (l recordingLogger) Errorf(msg string, args ...interface{}) { l.add("ERROR", msg, args...) }
+func (l recordingLogger) Sub(string) waLog.Logger                { return l }
+
+// logged reports whether any line logged so far contains every one of parts.
+func (l recordingLogger) logged(parts ...string) bool {
+	for _, line := range *l.lines {
+		all := true
+		for _, p := range parts {
+			all = all && strings.Contains(line, p)
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
+
+// withSendToken points HOME at a temporary folder and, unless token is nil,
+// writes the gate's send token file there with the given content.
+func withSendToken(t *testing.T, token []byte) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if token != nil {
+		path := filepath.Join(home, sendTokenFile)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, token, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return home
+}
+
+// postSend drives the real /api/send handler over HTTP, with a fake in place
+// of WhatsApp delivery, and reports the status and whether delivery was called.
+func postSend(t *testing.T, guard sendGuard, logger waLog.Logger, header string) (status int, delivered bool) {
+	t.Helper()
+	deliver := func(recipient, message, mediaPath string) (bool, string) {
+		delivered = true
+		return true, "sent"
+	}
+	srv := httptest.NewServer(sendHandler(guard, deliver, logger))
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL,
+		strings.NewReader(`{"recipient":"120363000000000000@g.us","message":"hello"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header != "" {
+		req.Header.Set(sendTokenHeader, header)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode, delivered
+}
+
+const testSendToken = "gate-token-for-tests"
+
+func TestSendGuard_NoTokenHeader_RefusedAndLogged(t *testing.T) {
+	withSendToken(t, []byte(testSendToken+"\n"))
+	logger := newRecordingLogger()
+
+	status, delivered := postSend(t, loadSendGuard(logger), logger, "")
+
+	if status != http.StatusForbidden || delivered {
+		t.Errorf("status = %d, delivered = %v; want 403 and nothing delivered", status, delivered)
+	}
+	if !logger.logged("refused: no gate token", "120363000000000000@g.us") {
+		t.Errorf("no refusal line naming the recipient was logged; got %q", *logger.lines)
+	}
+}
+
+func TestSendGuard_WrongToken_RefusedAndLogged(t *testing.T) {
+	withSendToken(t, []byte(testSendToken))
+	logger := newRecordingLogger()
+
+	status, delivered := postSend(t, loadSendGuard(logger), logger, "not-the-gate-token")
+
+	if status != http.StatusForbidden || delivered {
+		t.Errorf("status = %d, delivered = %v; want 403 and nothing delivered", status, delivered)
+	}
+	if !logger.logged("refused: no gate token", "120363000000000000@g.us") {
+		t.Errorf("no refusal line naming the recipient was logged; got %q", *logger.lines)
+	}
+}
+
+// The gate's own sends still go through: the token file's trailing newline is
+// not part of the token.
+func TestSendGuard_RightToken_Delivered(t *testing.T) {
+	withSendToken(t, []byte(testSendToken+"\n"))
+	logger := newRecordingLogger()
+
+	status, delivered := postSend(t, loadSendGuard(logger), logger, testSendToken)
+
+	if status != http.StatusOK || !delivered {
+		t.Errorf("status = %d, delivered = %v; want 200 and delivered", status, delivered)
+	}
+}
+
+// With no token file the guard is off and /api/send behaves as it did before
+// it, so the bridge and the gate can be switched over in either order.
+func TestSendGuard_NoTokenFile_DormantAndSaysSo(t *testing.T) {
+	withSendToken(t, nil)
+	logger := newRecordingLogger()
+
+	status, delivered := postSend(t, loadSendGuard(logger), logger, "")
+
+	if status != http.StatusOK || !delivered {
+		t.Errorf("status = %d, delivered = %v; want 200 and delivered", status, delivered)
+	}
+	if !logger.logged("Send guard off") {
+		t.Errorf("start-up did not log that the guard is off; got %q", *logger.lines)
+	}
+}
+
+// An empty token file must not let a send with no header through: a
+// constant-time compare of two empty values is a match.
+func TestSendGuard_EmptyTokenFile_RefusesEverySend(t *testing.T) {
+	withSendToken(t, []byte("\n"))
+	logger := newRecordingLogger()
+	guard := loadSendGuard(logger)
+
+	for _, header := range []string{"", " ", "anything"} {
+		if status, delivered := postSend(t, guard, logger, header); status != http.StatusForbidden || delivered {
+			t.Errorf("header %q: status = %d, delivered = %v; want 403 and nothing delivered",
+				header, status, delivered)
+		}
+	}
+}
+
+// A token file the bridge cannot read leaves the guard on and refusing.
+func TestSendGuard_UnreadableTokenFile_RefusesEverySend(t *testing.T) {
+	home := withSendToken(t, nil)
+	// A directory where the file should be: it exists, but reading it fails.
+	if err := os.MkdirAll(filepath.Join(home, sendTokenFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logger := newRecordingLogger()
+
+	status, delivered := postSend(t, loadSendGuard(logger), logger, testSendToken)
+
+	if status != http.StatusForbidden || delivered {
+		t.Errorf("status = %d, delivered = %v; want 403 and nothing delivered", status, delivered)
+	}
+	if !logger.logged("every send refused") {
+		t.Errorf("start-up did not log the refusal; got %q", *logger.lines)
+	}
+}
+
+// With no home folder the token file cannot be found, so the guard refuses
+// rather than switching itself off.
+func TestSendGuard_NoHomeFolder_RefusesEverySend(t *testing.T) {
+	t.Setenv("HOME", "")
+	logger := newRecordingLogger()
+
+	status, delivered := postSend(t, loadSendGuard(logger), logger, testSendToken)
+
+	if status != http.StatusForbidden || delivered {
+		t.Errorf("status = %d, delivered = %v; want 403 and nothing delivered", status, delivered)
 	}
 }
