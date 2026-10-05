@@ -1605,9 +1605,18 @@ func signalRetryWaiter(messageID string, res retryResult) {
 // ~9 June 2026). The re-uploaded media arrives asynchronously as an *events.MediaRetry,
 // handled by handleMediaRetry.
 func requestMediaRetry(client *whatsmeow.Client, chatJID, messageID, sender string, isFromMe bool, mediaKey []byte) error {
+	info, err := mediaRetryInfo(client, chatJID, messageID, sender, isFromMe)
+	if err != nil {
+		return err
+	}
+	return client.SendMediaRetryReceipt(context.Background(), info, mediaKey)
+}
+
+// mediaRetryInfo builds the message description a media-retry receipt is sent for.
+func mediaRetryInfo(client *whatsmeow.Client, chatJID, messageID, sender string, isFromMe bool) (*types.MessageInfo, error) {
 	chat, err := types.ParseJID(chatJID)
 	if err != nil {
-		return fmt.Errorf("invalid chat JID %q: %w", chatJID, err)
+		return nil, fmt.Errorf("invalid chat JID %q: %w", chatJID, err)
 	}
 	info := &types.MessageInfo{
 		ID: types.MessageID(messageID),
@@ -1620,7 +1629,7 @@ func requestMediaRetry(client *whatsmeow.Client, chatJID, messageID, sender stri
 	if info.IsGroup {
 		info.Sender = retryParticipantJID(client, sender)
 	}
-	return client.SendMediaRetryReceipt(context.Background(), info, mediaKey)
+	return info, nil
 }
 
 // retryParticipantJID resolves the sender recorded in the messages table to the JID
