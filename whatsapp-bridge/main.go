@@ -1623,11 +1623,19 @@ func mediaRetryInfo(client *whatsmeow.Client, chatJID, messageID, sender string,
 		MessageSource: types.MessageSource{
 			Chat:     chat,
 			IsFromMe: isFromMe,
-			IsGroup:  chat.Server == types.GroupServer,
+			// whatsmeow's parseMessageSource treats broadcast chats as groups too.
+			IsGroup: chat.Server == types.GroupServer || chat.Server == types.BroadcastServer,
 		},
 	}
 	if info.IsGroup {
 		info.Sender = retryParticipantJID(client, sender)
+		// SendMediaRetryReceipt writes an empty participant rather than omitting it,
+		// and a group's own number names nobody (history-synced rows before #133
+		// stored it). Either way the receipt cannot be routed: fail now instead of
+		// waiting out mediaRetryWaitTimeout.
+		if info.Sender.User == "" || info.Sender.User == chat.User {
+			return nil, fmt.Errorf("no routable participant for group media retry (stored sender %q)", sender)
+		}
 	}
 	return info, nil
 }
@@ -2596,33 +2604,37 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				// Determine sender. History-sync rows do not carry SenderAlt,
 				// so any LID-based participant is resolved through the
 				// whatsmeow LID store (populated during live message handling).
-				var sender string
-				isFromMe := false
-				if msg.Message.Key != nil {
-					if msg.Message.Key.FromMe != nil {
-						isFromMe = *msg.Message.Key.FromMe
-					}
-					var rawSender types.JID
-					switch {
-					case isFromMe && client.Store.ID != nil:
-						rawSender = client.Store.ID.ToNonAD()
-					case msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "":
-						if parsed, perr := types.ParseJID(*msg.Message.Key.Participant); perr == nil {
-							rawSender = parsed
-						} else {
-							rawSender = types.JID{User: *msg.Message.Key.Participant}
-						}
-					default:
-						rawSender = jid
-					}
-					var alt types.JID
-					if isFromMe && client.Store.ID != nil {
-						alt = client.Store.ID.ToNonAD()
-					}
-					sender = resolveUserJID(client, rawSender, alt).User
-				} else {
-					sender = jid.User
+				// The participant is read as whatsmeow's ParseWebMessage reads it:
+				// WebMessageInfo.Participant first, then Key.Participant.
+				isFromMe := msg.Message.GetKey().GetFromMe()
+				participant := msg.Message.GetParticipant()
+				if participant == "" {
+					participant = msg.Message.GetKey().GetParticipant()
 				}
+				var rawSender, alt types.JID
+				switch {
+				case isFromMe && client.Store.ID != nil:
+					rawSender = client.Store.ID.ToNonAD()
+					alt = rawSender
+				case strings.Contains(participant, "@"):
+					if parsed, perr := types.ParseJID(participant); perr == nil {
+						rawSender = parsed
+					} else {
+						rawSender = types.JID{User: participant}
+					}
+				case participant != "":
+					// types.ParseJID on a string with no "@" returns an empty user and
+					// no error; a bare participant is a phone number.
+					rawSender = types.NewJID(participant, types.DefaultUserServer)
+				case jid.Server == types.GroupServer || jid.Server == types.BroadcastServer:
+					// The sender is unknown. The group's own number names nobody, so
+					// leave it empty rather than store a sender that looks addressable.
+					logger.Warnf("History-sync message %s in %s has no participant; sender left empty",
+						histMsgID, chatJID)
+				default:
+					rawSender = jid
+				}
+				sender := resolveUserJID(client, rawSender, alt).User
 
 				// Store message
 				msgID := ""

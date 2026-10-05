@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -30,6 +31,8 @@ type mockLIDStore struct {
 	store.NoopStore
 	pnByLID map[types.JID]types.JID
 	lidByPN map[types.JID]types.JID
+	// nonPNLookups records GetLIDForPN calls the real store would refuse.
+	nonPNLookups []types.JID
 }
 
 func (m *mockLIDStore) GetPNForLID(_ context.Context, lid types.JID) (types.JID, error) {
@@ -40,6 +43,11 @@ func (m *mockLIDStore) GetPNForLID(_ context.Context, lid types.JID) (types.JID,
 }
 
 func (m *mockLIDStore) GetLIDForPN(_ context.Context, pn types.JID) (types.JID, error) {
+	// The real store (sqlstore.CachedLIDMap) refuses a non-phone JID with an error.
+	if pn.Server != types.DefaultUserServer {
+		m.nonPNLookups = append(m.nonPNLookups, pn)
+		return types.EmptyJID, fmt.Errorf("invalid GetLIDForPN call with non-PN JID %s", pn)
+	}
 	if lid, ok := m.lidByPN[pn]; ok {
 		return lid, nil
 	}
@@ -1751,5 +1759,197 @@ func TestRetryParticipantJID_QualifiedPhoneJIDResolvesToLID(t *testing.T) {
 
 	if got != phoneLID {
 		t.Errorf("participant JID = %q, want peer LID %q", got.String(), phoneLID.String())
+	}
+}
+
+// A sender the messages table stores as an LID is already the address a group
+// receipt wants, so it passes through without a LID-PN lookup. The real store
+// refuses that lookup for a non-phone JID.
+func TestRetryParticipantJID_LIDPassesThroughWithoutLookup(t *testing.T) {
+	lids := &mockLIDStore{}
+	client := newTestClient(lids)
+
+	got := retryParticipantJID(client, phoneLID.String())
+
+	if got != phoneLID {
+		t.Errorf("participant JID = %q, want the stored LID %q", got.String(), phoneLID.String())
+	}
+	if len(lids.nonPNLookups) != 0 {
+		t.Errorf("GetLIDForPN called with non-phone JIDs %v; the real store refuses these", lids.nonPNLookups)
+	}
+}
+
+func TestRetryParticipantJID_EmptySenderIsEmptyJID(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+
+	if got := retryParticipantJID(client, ""); !got.IsEmpty() {
+		t.Errorf("participant JID = %q, want empty", got.String())
+	}
+}
+
+// --- Media-retry receipt description (#133) ---
+
+var retryGroup = types.JID{User: "120363000000000001", Server: types.GroupServer}
+
+// whatsmeow's parseMessageSource treats a broadcast chat as a group, so a
+// status-broadcast retry receipt must carry a participant like a group one.
+func TestMediaRetryInfo_BroadcastChatCarriesParticipant(t *testing.T) {
+	client := newTestClient(&mockLIDStore{
+		lidByPN: map[types.JID]types.JID{phonePN: phoneLID},
+	})
+
+	info, err := mediaRetryInfo(client, types.StatusBroadcastJID.String(), "msg-1", phonePN.User, false)
+
+	if err != nil {
+		t.Fatalf("mediaRetryInfo returned an error: %v", err)
+	}
+	if !info.IsGroup {
+		t.Errorf("IsGroup = false for %s, want true (whatsmeow treats broadcast as a group)", info.Chat)
+	}
+	if info.Sender != phoneLID {
+		t.Errorf("participant = %q, want %q", info.Sender.String(), phoneLID.String())
+	}
+}
+
+func TestMediaRetryInfo_GroupWithPersonSender(t *testing.T) {
+	client := newTestClient(&mockLIDStore{
+		lidByPN: map[types.JID]types.JID{phonePN: phoneLID},
+	})
+
+	info, err := mediaRetryInfo(client, retryGroup.String(), "msg-1", phonePN.User, false)
+
+	if err != nil {
+		t.Fatalf("mediaRetryInfo returned an error: %v", err)
+	}
+	if !info.IsGroup || info.Sender != phoneLID {
+		t.Errorf("IsGroup=%v participant=%q, want true and %q", info.IsGroup, info.Sender.String(), phoneLID.String())
+	}
+}
+
+// A direct chat's receipt carries no participant, so an empty sender is fine.
+func TestMediaRetryInfo_DirectChatNeedsNoParticipant(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+
+	info, err := mediaRetryInfo(client, phonePN.String(), "msg-1", "", false)
+
+	if err != nil {
+		t.Fatalf("mediaRetryInfo returned an error: %v", err)
+	}
+	if info.IsGroup {
+		t.Errorf("IsGroup = true for direct chat %s", info.Chat)
+	}
+}
+
+// A group receipt with no participant cannot be routed; fail before sending it
+// rather than block on a re-upload that will never come.
+func TestMediaRetryInfo_GroupWithoutSenderFailsFast(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+
+	if _, err := mediaRetryInfo(client, retryGroup.String(), "msg-1", "", false); err == nil {
+		t.Error("mediaRetryInfo returned no error for a group message with no sender")
+	}
+}
+
+// History-synced rows written before #133 store the group's own user part as the
+// sender. That is well-formed but names no participant, so fail fast on it too.
+func TestMediaRetryInfo_GroupSenderIsGroupItselfFailsFast(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+
+	if _, err := mediaRetryInfo(client, retryGroup.String(), "msg-1", retryGroup.User, false); err == nil {
+		t.Error("mediaRetryInfo returned no error for a group message whose sender is the group itself")
+	}
+}
+
+// --- History-sync sender (#133) ---
+
+// historySyncOne runs handleHistorySync over a single message in one conversation.
+func historySyncOne(t *testing.T, client *whatsmeow.Client, chat types.JID, msg *waProto.WebMessageInfo) *MessageStore {
+	t.Helper()
+	ms := newTestMessageStore(t)
+	msg.MessageTimestamp = proto.Uint64(uint64(time.Now().Unix()))
+	msg.Message = &waProto.Message{Conversation: proto.String("history payload")}
+	handleHistorySync(client, ms, &events.HistorySync{
+		Data: &waProto.HistorySync{
+			SyncType: waProto.HistorySync_RECENT.Enum(),
+			Conversations: []*waProto.Conversation{{
+				ID:       proto.String(chat.String()),
+				Name:     proto.String("Test Group"), // keeps GetChatName off the network
+				Messages: []*waProto.HistorySyncMsg{{Message: msg}},
+			}},
+		},
+	}, testLogger())
+	return ms
+}
+
+// History sync carries a group message's sender on WebMessageInfo.Participant,
+// which whatsmeow's own ParseWebMessage reads before Key.Participant.
+func TestHandleHistorySync_GroupParticipantOnWebMessageInfo_StoredAsSender(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+
+	ms := historySyncOne(t, client, retryGroup, &waProto.WebMessageInfo{
+		Key: &waCommon.MessageKey{
+			RemoteJID: proto.String(retryGroup.String()),
+			ID:        proto.String("hist-grp-001"),
+			FromMe:    proto.Bool(false),
+		},
+		Participant: proto.String(phonePN.String()),
+	})
+
+	if got := querySender(ms, retryGroup.String()); got != phonePN.User {
+		t.Errorf("history-sync group sender = %q, want participant %q", got, phonePN.User)
+	}
+}
+
+// With no participant anywhere the sender is unknown. Storing the group's own
+// number would make the row look addressable when it is not.
+func TestHandleHistorySync_GroupWithoutParticipant_SenderIsNotTheGroup(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+
+	ms := historySyncOne(t, client, retryGroup, &waProto.WebMessageInfo{
+		Key: &waCommon.MessageKey{
+			RemoteJID: proto.String(retryGroup.String()),
+			ID:        proto.String("hist-grp-002"),
+			FromMe:    proto.Bool(false),
+		},
+	})
+
+	if got := querySender(ms, retryGroup.String()); got != "" {
+		t.Errorf("history-sync group sender = %q, want empty (unknown), never the group itself", got)
+	}
+}
+
+// In a direct chat the other party is the chat, so the chat stays the sender.
+func TestHandleHistorySync_DirectChatWithoutParticipant_SenderIsChat(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+
+	ms := historySyncOne(t, client, phonePN, &waProto.WebMessageInfo{
+		Key: &waCommon.MessageKey{
+			RemoteJID: proto.String(phonePN.String()),
+			ID:        proto.String("hist-dm-001"),
+			FromMe:    proto.Bool(false),
+		},
+	})
+
+	if got := querySender(ms, phonePN.String()); got != phonePN.User {
+		t.Errorf("history-sync direct-chat sender = %q, want %q", got, phonePN.User)
+	}
+}
+
+// types.ParseJID on a participant with no "@" returns an empty user and no error,
+// the trap behind #131. A bare participant is a phone number.
+func TestHandleHistorySync_BareParticipant_StoredAsPhoneUser(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+
+	ms := historySyncOne(t, client, retryGroup, &waProto.WebMessageInfo{
+		Key: &waCommon.MessageKey{
+			RemoteJID:   proto.String(retryGroup.String()),
+			ID:          proto.String("hist-grp-003"),
+			FromMe:      proto.Bool(false),
+			Participant: proto.String(phonePN.User),
+		},
+	})
+
+	if got := querySender(ms, retryGroup.String()); got != phonePN.User {
+		t.Errorf("history-sync sender = %q, want bare participant %q", got, phonePN.User)
 	}
 }
