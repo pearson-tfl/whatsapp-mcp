@@ -1718,6 +1718,24 @@ func TestSendWhatsAppMessage_StoreFailureStillReportsSuccess(t *testing.T) {
 	}
 }
 
+// --- CDN download path (#133) ---
+
+// The media CDN refuses a path without its oh= signature and oe= expiry with 403.
+// whatsmeow builds the request as host + direct path + "&hash=...", so the direct path
+// must keep the stored URL's query string intact. The URL shape is a real APHQ voice note.
+func TestExtractDirectPathFromURL_KeepsCDNSignature(t *testing.T) {
+	url := "https://mmg.whatsapp.net/v/t62.7117-24/839473981_1585119446146765_6749602816103538218_n.enc" +
+		"?ccb=11-4&oh=01_Q5Aa&oe=6928A1B2&_nc_sid=5e03e0&mms3=true"
+
+	got := extractDirectPathFromURL(url)
+
+	want := "/v/t62.7117-24/839473981_1585119446146765_6749602816103538218_n.enc" +
+		"?ccb=11-4&oh=01_Q5Aa&oe=6928A1B2&_nc_sid=5e03e0&mms3=true"
+	if got != want {
+		t.Errorf("direct path = %q, want %q", got, want)
+	}
+}
+
 // --- Media-retry participant JID (#131) ---
 
 // A group media-retry receipt must name the sender by the LID the group addresses
