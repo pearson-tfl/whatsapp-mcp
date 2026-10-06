@@ -1511,15 +1511,16 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// Download the media using whatsmeow client
 	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
-		// Since ~9 June 2026 WhatsApp's media CDN returns 403 for some accounts. The
-		// documented recovery is to ask the sender's device to re-upload the media via a
-		// media-retry receipt; the re-upload arrives asynchronously as an *events.MediaRetry,
+		// The CDN still refuses media whose signature (oe=) has expired, about 30 days after
+		// sending, or that it no longer holds. The recovery is to ask this account's own
+		// phone to re-upload it via a media-retry receipt (whatsmeow: "a request to the
+		// phone"); the re-upload arrives asynchronously as an *events.MediaRetry,
 		// which handleMediaRetry fetches and caches. Re-running this download then serves the
 		// file from the local cache above.
 		if errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) ||
 			errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) ||
 			errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) {
-			// Register a waiter, ask the sender's device to re-upload, then block until
+			// Register a waiter, ask this account's phone to re-upload, then block until
 			// handleMediaRetry fetches the fresh copy (or time out). This keeps CDN-403
 			// recovery transparent: a single download_media call still returns the media.
 			waiter := registerRetryWaiter(messageID)
@@ -1528,7 +1529,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 			if rErr := requestMediaRetry(client, chatJID, messageID, sender, isFromMe, mediaKey); rErr != nil {
 				return false, "", "", "", fmt.Errorf("media rejected by CDN and retry request failed: %w", rErr)
 			}
-			fmt.Printf("🔁 Media %s rejected by CDN (%v); requested re-upload, waiting for sender…\n", messageID, err)
+			fmt.Printf("🔁 Media %s rejected by CDN (%v); requested re-upload, waiting for this account's phone…\n", messageID, err)
 
 			select {
 			case res := <-waiter:
@@ -1537,7 +1538,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 				}
 				return true, res.mediaType, res.filename, res.path, nil
 			case <-time.After(mediaRetryWaitTimeout):
-				return false, "", "", "", fmt.Errorf("timed out after %s waiting for media re-upload (sender may be offline): %w", mediaRetryWaitTimeout, err)
+				return false, "", "", "", fmt.Errorf("timed out after %s waiting for media re-upload (this account's phone may be offline): %w", mediaRetryWaitTimeout, err)
 			}
 		}
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
@@ -1600,9 +1601,9 @@ func signalRetryWaiter(messageID string, res retryResult) {
 	}
 }
 
-// requestMediaRetry asks the sender's device to re-upload the media for a message whose
-// download WhatsApp's CDN rejected (HTTP 403/404/410 — common for some accounts since
-// ~9 June 2026). The re-uploaded media arrives asynchronously as an *events.MediaRetry,
+// requestMediaRetry asks this account's own phone to re-upload the media for a message
+// whose download WhatsApp's CDN rejected (HTTP 403/404/410, for example an expired
+// signature). The re-uploaded media arrives asynchronously as an *events.MediaRetry,
 // handled by handleMediaRetry.
 func requestMediaRetry(client *whatsmeow.Client, chatJID, messageID, sender string, isFromMe bool, mediaKey []byte) error {
 	info, err := mediaRetryInfo(client, chatJID, messageID, sender, isFromMe)
@@ -1680,7 +1681,7 @@ func handleMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, evt 
 	messageID := string(evt.MessageID)
 
 	// Deliver the outcome to a download_media caller blocking in downloadMedia, if any.
-	result := retryResult{err: fmt.Errorf("re-upload did not complete (sender may no longer have the media)")}
+	result := retryResult{err: fmt.Errorf("re-upload did not complete (this account's phone may not hold the media)")}
 	defer func() { signalRetryWaiter(messageID, result) }()
 
 	// The notification's ChatID can come back in @lid form, whereas the bridge stores
@@ -2104,7 +2105,7 @@ func main() {
 			handleMessage(client, messageStore, v, logger)
 
 		case *events.MediaRetry:
-			// Re-upload notification from the sender's device, triggered by requestMediaRetry
+			// Re-upload notification from this account's phone, triggered by requestMediaRetry
 			// when a media download was rejected (403/404/410). Fetch + cache the media now.
 			handleMediaRetry(client, messageStore, v, logger)
 
