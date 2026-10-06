@@ -1722,17 +1722,32 @@ func TestSendWhatsAppMessage_StoreFailureStillReportsSuccess(t *testing.T) {
 
 // The media CDN refuses a path without its oh= signature and oe= expiry with 403.
 // whatsmeow builds the request as host + direct path + "&hash=...", so the direct path
-// must keep the stored URL's query string intact. The URL shape is a real APHQ voice note.
+// must keep the stored URL's query string intact. The first URL has the shape of a real
+// voice note from the work store, with its oh= and oe= values replaced by placeholders.
 func TestExtractDirectPathFromURL_KeepsCDNSignature(t *testing.T) {
-	url := "https://mmg.whatsapp.net/v/t62.7117-24/839473981_1585119446146765_6749602816103538218_n.enc" +
-		"?ccb=11-4&oh=01_Q5Aa&oe=6928A1B2&_nc_sid=5e03e0&mms3=true"
-
-	got := extractDirectPathFromURL(url)
-
-	want := "/v/t62.7117-24/839473981_1585119446146765_6749602816103538218_n.enc" +
-		"?ccb=11-4&oh=01_Q5Aa&oe=6928A1B2&_nc_sid=5e03e0&mms3=true"
-	if got != want {
-		t.Errorf("direct path = %q, want %q", got, want)
+	cases := []struct{ name, url, want string }{
+		{
+			name: "signed CDN URL keeps its query",
+			url: "https://mmg.whatsapp.net/v/t62.7117-24/839473981_1585119446146765_6749602816103538218_n.enc" +
+				"?ccb=11-4&oh=01_Q5Aa&oe=6928A1B2&_nc_sid=5e03e0&mms3=true",
+			want: "/v/t62.7117-24/839473981_1585119446146765_6749602816103538218_n.enc" +
+				"?ccb=11-4&oh=01_Q5Aa&oe=6928A1B2&_nc_sid=5e03e0&mms3=true",
+		},
+		{
+			name: "URL without a query is just the path",
+			url:  "https://mmg.whatsapp.net/v/t62.7117-24/file.enc",
+			want: "/v/t62.7117-24/file.enc",
+		},
+		{
+			name: "URL without a .net/ host is returned unchanged",
+			url:  "https://example.com/v/t62.7117-24/file.enc?oh=01_Q5Aa",
+			want: "https://example.com/v/t62.7117-24/file.enc?oh=01_Q5Aa",
+		},
+	}
+	for _, tc := range cases {
+		if got := extractDirectPathFromURL(tc.url); got != tc.want {
+			t.Errorf("%s: direct path = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }
 

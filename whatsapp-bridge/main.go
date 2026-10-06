@@ -1681,7 +1681,7 @@ func handleMediaRetry(client *whatsmeow.Client, messageStore *MessageStore, evt 
 	messageID := string(evt.MessageID)
 
 	// Deliver the outcome to a download_media caller blocking in downloadMedia, if any.
-	result := retryResult{err: fmt.Errorf("re-upload did not complete (this account's phone may not hold the media)")}
+	result := retryResult{err: fmt.Errorf("re-upload did not complete (for example, this account's phone does not hold the media)")}
 	defer func() { signalRetryWaiter(messageID, result) }()
 
 	// The notification's ChatID can come back in @lid form, whereas the bridge stores
@@ -1773,7 +1773,7 @@ func extractDirectPathFromURL(url string) string {
 
 	// Keep the query string: it carries the CDN signature (oh=) and expiry (oe=).
 	// whatsmeow's Download rebuilds the URL as host + directPath + "&hash=...", and the
-	// CDN returns 403 when the signature is missing (upstream #132).
+	// CDN returns 403 when the signature is missing (verygoodplugins/whatsapp-mcp #132).
 	return "/" + parts[1]
 }
 
