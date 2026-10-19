@@ -2004,6 +2004,22 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	}()
 }
 
+// useCurrentWAVersion sets the client version to the one fetch reports, with
+// whatsmeow.GetLatestVersion reading it from web.whatsapp.com. A failed fetch
+// keeps the version built into whatsmeow and logs why (#4153,
+// Agent-Harness-Reconfig).
+func useCurrentWAVersion(logger waLog.Logger, fetch func(context.Context) (*store.WAVersionContainer, error)) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	current, err := fetch(ctx)
+	if err != nil {
+		logger.Warnf("Could not fetch WhatsApp's current web version, keeping the built-in %s: %v", store.GetWAVersion(), err)
+		return
+	}
+	store.SetWAVersion(*current)
+	logger.Infof("Using WhatsApp's current web version %s", current)
+}
+
 func main() {
 	flag.Parse()
 
@@ -2199,6 +2215,12 @@ func main() {
 		case *events.ClientOutdated:
 			logger.Errorf("❌ Client outdated - please update whatsmeow library")
 		}
+	})
+
+	// Announce WhatsApp's current web version, not the one this whatsmeow
+	// build carries: an old built-in version is refused as outdated (405).
+	useCurrentWAVersion(logger, func(ctx context.Context) (*store.WAVersionContainer, error) {
+		return whatsmeow.GetLatestVersion(ctx, nil)
 	})
 
 	// Create channel to track connection success

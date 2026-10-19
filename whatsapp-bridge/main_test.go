@@ -1986,3 +1986,27 @@ func TestHandleHistorySync_BareParticipant_StoredAsPhoneUser(t *testing.T) {
 		t.Errorf("history-sync sender = %q, want bare participant %q", got, phonePN.User)
 	}
 }
+
+// useCurrentWAVersion (#4153, Agent-Harness-Reconfig): WhatsApp's current web
+// version replaces the built-in one; a failed fetch keeps the built-in one.
+func TestUseCurrentWAVersion(t *testing.T) {
+	builtIn := store.GetWAVersion()
+	defer store.SetWAVersion(builtIn)
+	logger := waLog.Noop
+
+	current := store.WAVersionContainer{2, 3000, builtIn[2] + 1}
+	useCurrentWAVersion(logger, func(context.Context) (*store.WAVersionContainer, error) {
+		return &current, nil
+	})
+	if got := store.GetWAVersion(); got != current {
+		t.Fatalf("version after a good fetch = %v, want %v", got, current)
+	}
+
+	store.SetWAVersion(builtIn)
+	useCurrentWAVersion(logger, func(context.Context) (*store.WAVersionContainer, error) {
+		return nil, fmt.Errorf("version number not found")
+	})
+	if got := store.GetWAVersion(); got != builtIn {
+		t.Fatalf("version after a failed fetch = %v, want the built-in %v", got, builtIn)
+	}
+}
