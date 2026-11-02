@@ -2117,3 +2117,44 @@ func TestMigrateLegacyLIDChats_KeepsQuote(t *testing.T) {
 		t.Fatalf("got chat %q, quoted id %q, quoted %q", chat, quotedID, quotedContent)
 	}
 }
+
+// History sync stores the same row as the live handler, so a re-sync of a
+// swipe-reply keeps its quote rather than blanking it (#5270).
+func TestHandleHistorySync_SwipeReply_StoresQuote(t *testing.T) {
+	client := newTestClientWithSelf(&mockLIDStore{}, selfPhone)
+	ms := newTestMessageStore(t)
+	handleHistorySync(client, ms, &events.HistorySync{
+		Data: &waProto.HistorySync{
+			SyncType: waProto.HistorySync_RECENT.Enum(),
+			Conversations: []*waProto.Conversation{{
+				ID:   proto.String(retryGroup.String()),
+				Name: proto.String("Test Group"), // keeps GetChatName off the network
+				Messages: []*waProto.HistorySyncMsg{{Message: &waProto.WebMessageInfo{
+					Key: &waCommon.MessageKey{
+						RemoteJID: proto.String(retryGroup.String()),
+						ID:        proto.String("hist-quote-001"),
+						FromMe:    proto.Bool(false),
+					},
+					Participant:      proto.String(phonePN.String()),
+					MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
+					Message: &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{
+						Text: proto.String("As advised"),
+						ContextInfo: &waProto.ContextInfo{
+							StanzaID:      proto.String("3EB0QUOTED02"),
+							QuotedMessage: &waProto.Message{Conversation: proto.String("quoted #5270")},
+						},
+					}},
+				}}},
+			}},
+		},
+	}, testLogger())
+
+	var quotedID, quotedContent string
+	if err := ms.db.QueryRow(
+		"SELECT quoted_message_id, quoted_content FROM messages WHERE id = 'hist-quote-001'").Scan(&quotedID, &quotedContent); err != nil {
+		t.Fatalf("row not stored: %v", err)
+	}
+	if quotedID != "3EB0QUOTED02" || quotedContent != "quoted #5270" {
+		t.Fatalf("got quoted id %q, quoted %q", quotedID, quotedContent)
+	}
+}
