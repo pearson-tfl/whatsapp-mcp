@@ -1146,7 +1146,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// and the id of the message reacted to (Agent-Harness-Reconfig #5334).
 	if r := msg.Message.GetReactionMessage(); r != nil {
 		mediaType, content = "reaction", r.GetText()
-		quotedMessageId, quotedSender, quotedContent = r.GetKey().GetID(), "", ""
+		quotedMessageId = r.GetKey().GetID()
 	}
 
 	// Skip if there's no content and no media
