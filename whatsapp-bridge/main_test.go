@@ -2077,3 +2077,39 @@ func TestHandleMessage_PlainMessage_StoresNoQuote(t *testing.T) {
 		t.Fatalf("plain message got quote %q / %q", quotedID.String, quotedContent.String)
 	}
 }
+
+func TestMigrateLegacyLIDChats_KeepsQuote(t *testing.T) {
+	ms := newTestMessageStore(t)
+	whatsappDBPath := filepath.Join(t.TempDir(), "whatsapp.db")
+	waDB, err := sql.Open("sqlite3", whatsappDBPath)
+	if err != nil {
+		t.Fatalf("failed to create whatsapp db: %v", err)
+	}
+	defer func() { _ = waDB.Close() }()
+	if _, err := waDB.Exec(`
+		CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT NOT NULL);
+		INSERT INTO whatsmeow_lid_map (lid, pn) VALUES ('111', '222');
+	`); err != nil {
+		t.Fatalf("failed to prepare lid map db: %v", err)
+	}
+	if _, err := ms.db.Exec(`
+		INSERT INTO chats (jid, name, last_message_time) VALUES ('111@lid', 'Peer', '2026-03-01T10:00:00Z');
+		INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, quoted_message_id, quoted_content)
+			VALUES ('r1', '111@lid', '111', 'As advised', '2026-03-01T10:00:00Z', 0, 'Q1', 'quoted text');
+	`); err != nil {
+		t.Fatalf("failed to seed message store: %v", err)
+	}
+
+	if err := ms.MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath, testLogger()); err != nil {
+		t.Fatalf("migration failed: %v", err)
+	}
+
+	var chat, quotedID, quotedContent string
+	if err := ms.db.QueryRow(
+		"SELECT chat_jid, quoted_message_id, quoted_content FROM messages WHERE id = 'r1'").Scan(&chat, &quotedID, &quotedContent); err != nil {
+		t.Fatalf("row lost: %v", err)
+	}
+	if chat != "222@s.whatsapp.net" || quotedID != "Q1" || quotedContent != "quoted text" {
+		t.Fatalf("got chat %q, quoted id %q, quoted %q", chat, quotedID, quotedContent)
+	}
+}
