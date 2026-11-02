@@ -141,8 +141,31 @@ func NewMessageStore() (*MessageStore, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
+	if err := addQuoteColumns(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	return &MessageStore{db: db}, nil
+}
+
+// addQuoteColumns gives the messages table the reply context of a swipe-reply:
+// the quoted message's id and text (Agent-Harness-Reconfig #5270). A store
+// made before them gains them here; a column already there is left alone.
+func addQuoteColumns(db *sql.DB) error {
+	for _, col := range []string{"quoted_message_id", "quoted_content"} {
+		var n int
+		if err := db.QueryRow(
+			"SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = ?", col).Scan(&n); err != nil {
+			return fmt.Errorf("failed to read messages columns: %v", err)
+		}
+		if n == 0 {
+			if _, err := db.Exec("ALTER TABLE messages ADD COLUMN " + col + " TEXT"); err != nil {
+				return fmt.Errorf("failed to add column %s: %v", col, err)
+			}
+		}
+	}
+	return nil
 }
 
 // MigrateLegacyLIDChatsToPhoneJIDs rewrites message/chat rows stored under
@@ -495,7 +518,8 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	quotedMessageID, quotedContent string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -503,9 +527,10 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, quoted_content) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		quotedMessageID, quotedContent,
 	)
 	return err
 }
@@ -1125,6 +1150,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedMessageId,
+		quotedContent,
 	)
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
@@ -1316,6 +1343,7 @@ func storeOutgoingMessage(client *whatsmeow.Client, messageStore *MessageStore, 
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		"", "", // a send carries no reply context
 	); err != nil {
 		return fmt.Errorf("failed to store message: %w", err)
 	}
@@ -2669,6 +2697,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 				msgTimestamp := time.Unix(int64(ts), 0)
 
+				// The same row as the live handler's, so a re-sync keeps its quote.
+				quotedID, _, quotedText := extractQuotedMessageInfo(msg.Message.GetMessage())
 				err = messageStore.StoreMessage(
 					msgID,
 					chatJID,
@@ -2683,6 +2713,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					quotedID,
+					quotedText,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)

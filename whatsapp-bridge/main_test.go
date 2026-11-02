@@ -130,6 +130,11 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 	if err != nil {
 		t.Fatalf("failed to create tables: %v", err)
 	}
+	// The tables above are the store as it stood before #5270; start-up adds
+	// the reply-context columns to it, as it does to a live store.
+	if err := addQuoteColumns(db); err != nil {
+		t.Fatalf("failed to add quote columns: %v", err)
+	}
 	t.Cleanup(func() { _ = db.Close() })
 	return &MessageStore{db: db}
 }
@@ -2008,5 +2013,67 @@ func TestUseCurrentWAVersion(t *testing.T) {
 	})
 	if got := store.GetWAVersion(); got != builtIn {
 		t.Fatalf("version after a failed fetch = %v, want the built-in %v", got, builtIn)
+	}
+}
+
+// --- Reply context (Agent-Harness-Reconfig #5270) ---
+
+func TestAddQuoteColumns_RunsTwiceOnAnOldStore(t *testing.T) {
+	ms := newTestMessageStore(t) // already run once
+	if err := addQuoteColumns(ms.db); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	for _, col := range []string{"quoted_message_id", "quoted_content"} {
+		var n int
+		if err := ms.db.QueryRow(
+			"SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = ?", col).Scan(&n); err != nil || n != 1 {
+			t.Fatalf("column %s: count %d, err %v", col, n, err)
+		}
+	}
+}
+
+func TestHandleMessage_SwipeReply_StoresQuotedIdAndText(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	msg := buildTextMessage(phonePN, phonePN, types.EmptyJID, types.EmptyJID, false, "")
+	msg.Message = &waProto.Message{
+		ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text: proto.String("As advised"),
+			ContextInfo: &waProto.ContextInfo{
+				StanzaID:      proto.String("3EB0QUOTED01"),
+				Participant:   proto.String("15550000000@s.whatsapp.net"),
+				QuotedMessage: &waProto.Message{Conversation: proto.String("harness-pm (Claude): ponytail, #5268\nsecond line")},
+			},
+		},
+	}
+
+	handleMessage(client, ms, msg, testLogger())
+
+	var content, quotedID, quotedContent string
+	err := ms.db.QueryRow(
+		"SELECT content, quoted_message_id, quoted_content FROM messages WHERE id = ?",
+		"test-msg-001").Scan(&content, &quotedID, &quotedContent)
+	if err != nil {
+		t.Fatalf("row not stored: %v", err)
+	}
+	if content != "As advised" || quotedID != "3EB0QUOTED01" ||
+		quotedContent != "harness-pm (Claude): ponytail, #5268\nsecond line" {
+		t.Fatalf("got content %q, quoted id %q, quoted %q", content, quotedID, quotedContent)
+	}
+}
+
+func TestHandleMessage_PlainMessage_StoresNoQuote(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	handleMessage(client, ms, buildTextMessage(phonePN, phonePN, types.EmptyJID, types.EmptyJID, false, "hello"), testLogger())
+
+	var quotedID, quotedContent sql.NullString
+	if err := ms.db.QueryRow(
+		"SELECT quoted_message_id, quoted_content FROM messages WHERE id = ?",
+		"test-msg-001").Scan(&quotedID, &quotedContent); err != nil {
+		t.Fatalf("row not stored: %v", err)
+	}
+	if quotedID.String != "" || quotedContent.String != "" {
+		t.Fatalf("plain message got quote %q / %q", quotedID.String, quotedContent.String)
 	}
 }
