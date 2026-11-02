@@ -1665,9 +1665,13 @@ func TestSendWhatsAppMessage_StoresTheSentMessage(t *testing.T) {
 
 	// Address the LID directly, so the send path's own phone-to-LID lookup —
 	// which would reach the network — is skipped.
-	ok, msg := sendWhatsAppMessage(client, wa, ms, phoneLID.String(), "wired through to the store", "", testLogger())
+	ok, msg, sentID := sendWhatsAppMessage(client, wa, ms, phoneLID.String(), "wired through to the store", "", testLogger())
 	if !ok {
 		t.Fatalf("expected the send to succeed, got %q", msg)
+	}
+	// /api/send returns this id, which the send ledger records (#5270).
+	if sentID != "wired-001" {
+		t.Errorf("expected the sent id wired-001, got %q", sentID)
 	}
 
 	row, chatJID := queryOutgoingRow(t, ms, "wired-001")
@@ -1696,7 +1700,7 @@ func TestSendWhatsAppMessage_FailedSendStoresNothing(t *testing.T) {
 	client := newTestClientWithSelf(&mockLIDStore{}, phonePN)
 	ms := newTestMessageStore(t)
 
-	if ok, _ := sendWhatsAppMessage(client, wa, ms, phoneLID.String(), "never delivered", "", testLogger()); ok {
+	if ok, _, _ := sendWhatsAppMessage(client, wa, ms, phoneLID.String(), "never delivered", "", testLogger()); ok {
 		t.Fatal("expected the send to report failure")
 	}
 	if count := queryMessageCount(ms, phonePN.String()); count != 0 {
@@ -1717,7 +1721,7 @@ func TestSendWhatsAppMessage_StoreFailureStillReportsSuccess(t *testing.T) {
 		t.Fatalf("failed to close the test database: %v", err)
 	}
 
-	ok, msg := sendWhatsAppMessage(client, wa, ms, phoneLID.String(), "delivered but unstorable", "", testLogger())
+	ok, msg, _ := sendWhatsAppMessage(client, wa, ms, phoneLID.String(), "delivered but unstorable", "", testLogger())
 	if !ok {
 		t.Errorf("expected a delivered message to report success despite the store failure, got %q", msg)
 	}
