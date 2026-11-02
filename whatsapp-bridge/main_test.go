@@ -2077,8 +2077,8 @@ func TestHandleMessage_PlainMessage_StoresNoQuote(t *testing.T) {
 		"test-msg-001").Scan(&quotedID, &quotedContent); err != nil {
 		t.Fatalf("row not stored: %v", err)
 	}
-	if quotedID.String != "" || quotedContent.String != "" {
-		t.Fatalf("plain message got quote %q / %q", quotedID.String, quotedContent.String)
+	if quotedID.Valid || quotedContent.Valid {
+		t.Fatalf("plain message got quote %v / %v, want NULL", quotedID, quotedContent)
 	}
 }
 
