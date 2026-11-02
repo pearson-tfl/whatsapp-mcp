@@ -1142,6 +1142,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract quoted message info
 	quotedMessageId, quotedSender, quotedContent := extractQuotedMessageInfo(msg.Message)
 
+	// A reaction is a row of kind "reaction": the emoji (empty when removed)
+	// and the id of the message reacted to (Agent-Harness-Reconfig #5334).
+	if r := msg.Message.GetReactionMessage(); r != nil {
+		mediaType, content = "reaction", r.GetText()
+		quotedMessageId, quotedSender, quotedContent = r.GetKey().GetID(), "", ""
+	}
+
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
 		return
@@ -1217,7 +1224,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Forward self-messages when FORWARD_SELF=true.
 	// Always forward image messages (even without a text caption) so the AI vision
 	// pipeline can analyse the image content.
-	shouldForward := forwardSelfMessages || !msg.Info.IsFromMe
+	shouldForward := (forwardSelfMessages || !msg.Info.IsFromMe) && mediaType != "reaction"
 	hasText := content != ""
 	hasImage := mediaType == "image"
 
