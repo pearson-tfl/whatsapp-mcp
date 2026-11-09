@@ -2158,3 +2158,41 @@ func TestHandleHistorySync_SwipeReply_StoresQuote(t *testing.T) {
 		t.Fatalf("got quoted id %q, quoted %q", quotedID, quotedContent)
 	}
 }
+
+// A reaction is a row (Agent-Harness-Reconfig #5334): kind reaction, the emoji
+// as content, the reacted-to id in quoted_message_id, never sent to the webhook.
+func TestHandleMessage_Reaction_StoredAsRowNotForwarded(t *testing.T) {
+	srv, webhookCh := captureWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	for i, emoji := range []string{"👍", "👍🏽", ""} { // thumbs-up variants, then removal
+		msg := buildTextMessage(phonePN, phoneLID, phonePN, types.EmptyJID, false, "")
+		msg.Info.ID = fmt.Sprintf("react-%d", i)
+		msg.Info.Timestamp = time.Date(2026, time.November, 9, 10, 0, i, 0, time.UTC)
+		msg.Message = &waProto.Message{ReactionMessage: &waProto.ReactionMessage{
+			Key:  &waCommon.MessageKey{ID: proto.String("3EB0CODEMSG1")},
+			Text: proto.String(emoji),
+		}}
+		handleMessage(client, ms, msg, testLogger())
+
+		var kind, content, target, sender string
+		var timestamp time.Time
+		if err := ms.db.QueryRow(
+			"SELECT media_type, content, quoted_message_id, sender, timestamp FROM messages WHERE id = ?",
+			msg.Info.ID).Scan(&kind, &content, &target, &sender, &timestamp); err != nil {
+			t.Fatalf("reaction %q not stored: %v", emoji, err)
+		}
+		if kind != "reaction" || content != emoji || target != "3EB0CODEMSG1" || sender != phonePN.User {
+			t.Fatalf("got kind %q content %q target %q sender %q", kind, content, target, sender)
+		}
+		if !timestamp.Equal(msg.Info.Timestamp) {
+			t.Fatalf("reaction %q timestamp = %v, want %v", emoji, timestamp, msg.Info.Timestamp)
+		}
+	}
+	select {
+	case p := <-webhookCh:
+		t.Fatalf("reaction forwarded to webhook: %+v", p)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
