@@ -304,6 +304,22 @@ Caveats:
 - **Only effective on a fresh pair.** With `whatsapp.db` already present, no new pair handshake fires and the flag is a no-op.
 - **Messages the phone has deleted are not recoverable** — auto-expire, low-storage cleanup, and manual delete all leave no trace for the phone to share.
 
+## Reaction Records
+
+The bridge stores incoming live reactions in `messages.db.messages` using the
+existing columns:
+
+- `media_type = 'reaction'`
+- `sender`: the reacting actor, resolved to the phone user-part when available
+- `quoted_message_id`: the id of the message reacted to, not the reaction's own `id`
+- `content`: the emoji, including any skin tone; an empty string records removal
+- `timestamp`: the reaction event's message timestamp
+
+Reactions are stored even on removal and are not forwarded to the text webhook.
+Consumers can query `WHERE media_type = 'reaction'`; approval rules and poller
+handling are separate from bridge capture. This does not backfill reactions
+missed while capture was unavailable.
+
 ## Call History
 
 The bridge captures incoming WhatsApp voice and video calls live into a
